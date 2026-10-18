@@ -9,7 +9,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/sbin/veth-renamer --mode=primary --mapping-file=/run/veth-renamer/mappings.json
+ExecStart=/usr/sbin/veth-renamer --mode=primary --mapping-file=/run/veth-renamer/mappings.json
 Restart=on-failure
 RestartSec=5
 RuntimeDirectory=veth-renamer

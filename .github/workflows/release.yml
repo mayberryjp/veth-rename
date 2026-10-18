@@ -1,0 +1,64 @@
+name: Test and release
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go test -race ./...
+      - run: go vet ./...
+      - name: Validate shell scripts
+        run: |
+          for script in install.sh tests/*.sh; do bash -n "$script"; done
+          for script in packaging/*.sh; do sh -n "$script"; done
+          shellcheck install.sh tests/*.sh packaging/*.sh
+      - run: bash tests/installer_test.sh
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: v2.18.3
+          args: check
+      - name: Build snapshot packages
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: v2.18.3
+          args: release --snapshot --clean
+      - name: Check Debian packages
+        run: bash tests/package_test.sh
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: v2.18.3
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

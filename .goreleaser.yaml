@@ -1,0 +1,70 @@
+version: 2
+
+project_name: veth-renamer
+
+builds:
+  - id: veth-renamer
+    main: .
+    binary: veth-renamer
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - deploy/veth-renamer.service
+
+nfpms:
+  - id: deb
+    package_name: veth-renamer
+    file_name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Arch }}"
+    homepage: https://github.com/mayberryjp/veth-rename
+    maintainer: mayberryjp <mayberryjp@users.noreply.github.com>
+    description: Label-driven naming of Docker host-side bridge veth interfaces.
+    section: admin
+    priority: optional
+    formats:
+      - deb
+    bindir: /usr/sbin
+    dependencies:
+      - iproute2
+      - util-linux
+      - systemd
+    contents:
+      - src: deploy/veth-renamer.service
+        dst: /usr/lib/systemd/system/veth-renamer.service
+        file_info:
+          mode: 0644
+      - src: README.md
+        dst: /usr/share/doc/veth-renamer/README.md
+        file_info:
+          mode: 0644
+    scripts:
+      postinstall: packaging/postinstall.sh
+      preremove: packaging/preremove.sh
+      postremove: packaging/postremove.sh
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+  extra_files:
+    - glob: install.sh
+
+release:
+  github:
+    owner: mayberryjp
+    name: veth-rename
+  extra_files:
+    - glob: install.sh

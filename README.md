@@ -88,6 +88,74 @@ their ownership:
 sudo ip link property del dev veth_original altname veth_old
 ```
 
+## One-line installation (Ubuntu)
+
+Once a release is published in
+[mayberryjp/veth-rename](https://github.com/mayberryjp/veth-rename):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-rename/main/install.sh | bash
+```
+
+The installer detects the Debian architecture (`amd64` or `arm64`), resolves the
+latest stable GitHub release, downloads its `.deb` and `checksums.txt`, verifies
+the SHA-256 digest and package identity, and installs it through `apt-get`.
+It uses `sudo` only for package installation and optional service control.
+Requires `curl`, `sudo` (unless already root), and standard Ubuntu package tools.
+If needed, run `sudo apt-get update` before installing so dependency indexes are
+current. No Go toolchain is needed on the target host.
+
+**Installation does not start, enable, or restart the daemon by default.**
+To explicitly enable and start it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-rename/main/install.sh | bash -s -- --start
+```
+
+`--start` enables and restarts the service, including on upgrades, so the newly
+installed binary is used. The default naming mode remains **primary**, with the
+UP-link limitation described above. Set a systemd override if you prefer
+alternative names.
+
+For reproducible installs, pin both the script and package to a release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-rename/v0.1.0/install.sh | bash -s -- --version v0.1.0
+```
+
+These URLs require the source and a release to be published; the `v0.1.0` example
+is not a claim that such a release already exists. The `main` branch URL tracks
+the newest installer, while the default package version is the newest stable
+release. Explicit `--version` also supports prerelease tags. Forks can use
+`--repo OWNER/REPO` with an installer downloaded from their own repository.
+
+Piping a script into Bash executes downloaded code. For greater control,
+download and inspect it before running. Checksums detect corrupt or mismatched
+assets; because the package and checksums come from the same GitHub release,
+they do not protect against a compromised repository or publisher.
+
+### Upgrade and uninstall
+
+Rerun the installer to upgrade. Existing systemd overrides are preserved.
+Without `--start`, a running daemon keeps its old process until you explicitly
+run `sudo systemctl restart veth-renamer.service`.
+
+```bash
+sudo apt-get remove veth-renamer
+```
+
+Removal stops and disables the service. Administrator-created overrides are
+left alone. Neither removal nor stopping the service restores primary names or
+deletes alternative names on existing interfaces.
+
+The package installs the binary in `/usr/sbin` and the unit in
+`/usr/lib/systemd/system`. If migrating from an older manual install in
+`/etc/systemd/system/veth-renamer.service`, first back up that local unit and
+migrate custom settings into a systemd drop-in. Stop the service and remove the
+old local unit after backing it up, then run `sudo systemctl daemon-reload` and
+retry the installer. It refuses to silently override a local unit. An old
+`/usr/local/sbin/veth-renamer` binary can be removed separately after migration.
+
 ## Build and preview
 
 Requires Go 1.23+ to build; no Go modules need downloading.
@@ -119,7 +187,7 @@ commands inside the containers.
 ## Install as a host service
 
 ```bash
-sudo install -m 0755 bin/veth-renamer /usr/local/sbin/veth-renamer
+sudo install -m 0755 bin/veth-renamer /usr/sbin/veth-renamer
 sudo install -m 0644 deploy/veth-renamer.service /etc/systemd/system/veth-renamer.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now veth-renamer
@@ -137,7 +205,7 @@ Add this override:
 ```ini
 [Service]
 ExecStart=
-ExecStart=/usr/local/sbin/veth-renamer --mode=alternative --mapping-file=/run/veth-renamer/mappings.json
+ExecStart=/usr/sbin/veth-renamer --mode=alternative --mapping-file=/run/veth-renamer/mappings.json
 ```
 
 Then run `sudo systemctl daemon-reload && sudo systemctl restart veth-renamer`.
@@ -241,3 +309,43 @@ Before enabling the service on important workloads:
    Restart Docker only on a test host and confirm the event stream reconnects.
 
 No live-host networking or Docker tests are automatically run by `go test`.
+
+## Publishing releases
+
+[.goreleaser.yaml](.goreleaser.yaml) builds Linux amd64/arm64 binaries, standalone
+archives, Debian packages, and SHA-256 checksums. The package declares
+`iproute2`, `util-linux`, and `systemd` dependencies; Docker must already be set
+up separately. Package scripts reload systemd but never automatically start,
+enable, or restart the service, including during upgrades.
+
+[The GitHub Actions workflow](.github/workflows/release.yml) runs Go tests/vet,
+shell syntax checks and ShellCheck, mocked installer tests, a snapshot package
+build, and Debian package structure checks before permitting a tagged release.
+
+To publish:
+
+1. Commit and push this project to `mayberryjp/veth-rename`, with `main` as the
+   default branch. The source must be published for the raw installer URL to work.
+2. Push a semantic version tag, for example `v0.1.0`. The workflow creates the
+   GitHub Release and uploads `.deb` packages, archives, `checksums.txt`, and
+   `install.sh`. It uses the workflow's `GITHUB_TOKEN`; no personal token is needed.
+3. Confirm the workflow passed and the release contains
+   `veth-renamer_0.1.0_amd64.deb` and `veth-renamer_0.1.0_arm64.deb` before
+   sharing the install command.
+
+Locally, with GoReleaser v2.18.3, Bash, and Debian package tools available:
+
+```bash
+go test ./...
+go vet ./...
+bash tests/installer_test.sh
+goreleaser check
+goreleaser release --snapshot --clean
+bash tests/package_test.sh
+```
+
+Snapshot builds require a Git checkout but do not upload or publish anything.
+Installer tests stub all downloads, package installation, privilege escalation,
+and service control; they never install packages or change host services.
+Live package installation/removal and systemd behavior still need verification
+on a disposable Ubuntu host.
