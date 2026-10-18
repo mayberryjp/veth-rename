@@ -120,10 +120,10 @@ alternative names.
 For reproducible installs, pin both the script and package to a release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-rename/v0.1.0/install.sh | bash -s -- --version v0.1.0
+curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-rename/v0.1.1/install.sh | bash -s -- --version v0.1.1
 ```
 
-These URLs require the source and a release to be published; the `v0.1.0` example
+These URLs require the source and a release to be published; the `v0.1.1` example
 is not a claim that such a release already exists. The `main` branch URL tracks
 the newest installer, while the default package version is the newest stable
 release. Explicit `--version` also supports prerelease tags. Forks can use
@@ -326,11 +326,11 @@ To publish:
 
 1. Commit and push this project to `mayberryjp/veth-rename`, with `main` as the
    default branch. The source must be published for the raw installer URL to work.
-2. Push a semantic version tag, for example `v0.1.0`. The workflow creates the
+2. Push a semantic version tag, for example `v0.1.1`. The workflow creates the
    GitHub Release and uploads `.deb` packages, archives, `checksums.txt`, and
    `install.sh`. It uses the workflow's `GITHUB_TOKEN`; no personal token is needed.
 3. Confirm the workflow passed and the release contains
-   `veth-renamer_0.1.0_amd64.deb` and `veth-renamer_0.1.0_arm64.deb` before
+   `veth-renamer_0.1.1_amd64.deb` and `veth-renamer_0.1.1_arm64.deb` before
    sharing the install command.
 
 Locally, with GoReleaser v2.18.3, Bash, and Debian package tools available:

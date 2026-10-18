@@ -30,7 +30,9 @@ die() {
 while (($#)); do
     case "$1" in
         --version|--repo)
-            (($# >= 2)) && [[ -n "$2" ]] || die "$1 requires a value"
+            if (($# < 2)) || [[ -z "$2" ]]; then
+                die "$1 requires a value"
+            fi
             if [[ "$1" == --version ]]; then version=$2; else repo=$2; fi
             shift 2
             ;;
