@@ -95,9 +95,27 @@ func desiredName(c container, networkName string) (string, bool, error) {
 	return base + "-" + hex.EncodeToString(hash[:3]), true, nil
 }
 
+func networkKind(n network) string {
+	if strings.HasPrefix(n.Driver, "ghcr.io/claymore666/docker-net-dhcp:") {
+		switch n.Options["mode"] {
+		case "", "bridge":
+			return "bridge"
+		case "macvlan":
+			return "macvlan"
+		}
+	}
+	return n.Driver
+}
+
 func bridgeName(n network) (string, error) {
-	if n.Driver != "bridge" {
+	if networkKind(n) != "bridge" {
 		return "", fmt.Errorf("unsupported network driver %q", n.Driver)
+	}
+	if n.Driver != "bridge" {
+		if name := n.Options["bridge"]; name != "" {
+			return name, nil
+		}
+		return "", fmt.Errorf("DHCP bridge network has no bridge interface configured")
 	}
 	if name := n.Options["com.docker.network.bridge.name"]; name != "" {
 		return name, nil
@@ -173,8 +191,8 @@ func (r reconciler) run(ctx context.Context) (snapshot, error) {
 				continue
 			}
 			plan := candidate{record: i, c: c, ep: ep}
-			switch {
-			case n.Driver == "bridge":
+			switch networkKind(n) {
+			case "bridge":
 				bridge, err := bridgeName(n)
 				if err != nil {
 					fail(i, err)
@@ -182,8 +200,7 @@ func (r reconciler) run(ctx context.Context) (snapshot, error) {
 				}
 				result.Mappings[i].Bridge = bridge
 				result.Mappings[i].Namespace = "host"
-			case n.Driver == "macvlan" ||
-				(strings.HasPrefix(n.Driver, "ghcr.io/claymore666/docker-net-dhcp:") && n.Options["mode"] == "macvlan"):
+			case "macvlan":
 				plan.pid, plan.parent = c.State.Pid, n.Options["parent"]
 				result.Mappings[i].Namespace = "container"
 			default:

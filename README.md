@@ -32,6 +32,13 @@ not provide that strategy.
 
 ## Macvlan and docker-net-dhcp networks
 
+`ghcr.io/claymore666/docker-net-dhcp:<tag>` networks configured with
+`mode=bridge` (also the plugin's default when `mode` is omitted) are supported.
+The network must specify its host bridge with the `bridge` option, for example
+`{"bridge":"br-vlan20","mode":"bridge"}`. These endpoints use host-side veth
+naming with the same reciprocal-peer and bridge-membership checks as Docker's
+built-in bridge driver. The shared bridge itself is never renamed.
+
 Native Docker `macvlan` networks and
 `ghcr.io/claymore666/docker-net-dhcp:<tag>` networks configured with
 `mode=macvlan` are supported. The network must specify its host `parent`
@@ -252,7 +259,8 @@ Do not enable `PrivateNetwork`: that would hide the host interfaces.
   sysfs lookup inside just a network namespace.
 - Supports the default bridge, custom Compose bridges, and explicit bridge
   names, plus container-side naming for the macvlan networks described above.
-  Host/shared network namespaces are excluded; other drivers and DHCP plugin
+  DHCP plugin bridge mode also supports host-side veth naming.
+  Host/shared network namespaces are excluded; other drivers and unsupported
   modes (including overlay, ipvlan, and none) are not managed.
 - Revalidates the container PID/endpoint and both ends immediately before a
   change, checks primary and alternative-name collisions, and verifies the

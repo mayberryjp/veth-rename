@@ -215,7 +215,7 @@ func TestMacvlanApplyFailures(t *testing.T) {
 }
 
 func TestDHCPUnsupportedModesRemainSkipped(t *testing.T) {
-	for _, mode := range []string{"", "ipvlan", "bridge"} {
+	for _, mode := range []string{"ipvlan", "overlay", "unknown"} {
 		t.Run(mode, func(t *testing.T) {
 			d, l, r := macvlanFixture("ghcr.io/claymore666/docker-net-dhcp:v2.3.1")
 			d.ns["0123456789abcdef"].Options["mode"] = mode
