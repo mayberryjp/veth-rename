@@ -1,5 +1,5 @@
 [Unit]
-Description=Label-driven Docker host veth naming
+Description=Label-driven Docker veth and container macvlan naming
 Documentation=https://docs.docker.com/engine/network/drivers/bridge/
 Wants=docker.service
 After=docker.service

@@ -25,7 +25,7 @@ type link struct {
 type linkAPI interface {
 	host(context.Context) ([]link, error)
 	namespace(context.Context, int) ([]link, error)
-	apply(context.Context, string, string, string) error
+	apply(context.Context, int, string, string, string) error
 }
 
 type commandLinks struct {
@@ -64,13 +64,22 @@ func (l commandLinks) namespace(ctx context.Context, pid int) ([]link, error) {
 	return readLinks(ctx, l.nsenter, "-t", strconv.Itoa(pid), "-n", "--", l.ip, "-j", "-d", "link", "show")
 }
 
-func (l commandLinks) apply(ctx context.Context, current, desired, mode string) error {
-	var err error
+func (l commandLinks) nameCommand(pid int, current, desired, mode string) (string, []string) {
+	var args []string
 	if mode == "alternative" {
-		_, err = command(ctx, l.ip, "link", "property", "add", "dev", current, "altname", desired)
+		args = []string{"link", "property", "add", "dev", current, "altname", desired}
 	} else {
-		_, err = command(ctx, l.ip, "link", "set", "dev", current, "name", desired)
+		args = []string{"link", "set", "dev", current, "name", desired}
 	}
+	if pid > 0 {
+		return l.nsenter, append([]string{"-t", strconv.Itoa(pid), "-n", "--", l.ip}, args...)
+	}
+	return l.ip, args
+}
+
+func (l commandLinks) apply(ctx context.Context, pid int, current, desired, mode string) error {
+	program, args := l.nameCommand(pid, current, desired, mode)
+	_, err := command(ctx, program, args...)
 	return err
 }
 
@@ -103,6 +112,34 @@ func findPeer(inner, host []link, mac, bridge string) (link, error) {
 	}
 	if len(matches) != 1 {
 		return link{}, fmt.Errorf("expected one reciprocal veth peer on bridge %q for MAC %s; found %d", bridge, mac, len(matches))
+	}
+	return matches[0], nil
+}
+
+func findMacvlan(inner, host []link, mac, parent string) (link, error) {
+	if mac == "" {
+		return link{}, fmt.Errorf("Docker endpoint has no MAC address yet")
+	}
+	if parent == "" {
+		return link{}, fmt.Errorf("macvlan network has no parent interface configured")
+	}
+	var parents []link
+	for _, h := range host {
+		if ownsName(h, parent) && h.Index > 0 {
+			parents = append(parents, h)
+		}
+	}
+	if len(parents) != 1 {
+		return link{}, fmt.Errorf("expected one host parent interface %q; found %d", parent, len(parents))
+	}
+	var matches []link
+	for _, in := range inner {
+		if strings.EqualFold(in.Address, mac) && in.Info.Kind == "macvlan" && in.Peer == parents[0].Index {
+			matches = append(matches, in)
+		}
+	}
+	if len(matches) != 1 {
+		return link{}, fmt.Errorf("expected one macvlan interface on parent %q for MAC %s; found %d", parent, mac, len(matches))
 	}
 	return matches[0], nil
 }

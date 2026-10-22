@@ -2,7 +2,8 @@
 
 A small, dependency-free Go daemon for **rootful Docker Engine on an Ubuntu
 host**. It reads container labels, finds the matching host-side bridge veth,
-and applies a primary or alternative interface name. Unlabeled containers are
+and applies a primary or alternative interface name. It also names macvlan
+interfaces inside container network namespaces. Unlabeled containers are
 never renamed.
 
 ## Important correction to the original proposal
@@ -28,6 +29,27 @@ If primary names are essential and your kernel rejects the rename, applying them
 requires a different deployment strategy that names links before they are UP,
 or an explicitly scheduled interruption outside this service. This daemon does
 not provide that strategy.
+
+## Macvlan and docker-net-dhcp networks
+
+Native Docker `macvlan` networks and
+`ghcr.io/claymore666/docker-net-dhcp:<tag>` networks configured with
+`mode=macvlan` are supported. The network must specify its host `parent`
+interface, for example `enp44s0.20`.
+
+Macvlan has no host-side veth peer. For these networks, the same labels and
+`--mode` setting apply to the MAC-matched macvlan interface **inside the
+container's network namespace**, not to the shared host parent. The daemon
+validates the kernel link type and parent index before changing anything.
+It never renames the host VLAN or physical interface.
+
+Primary mode attempts a primary rename without bringing the interface down.
+An UP macvlan interface can reject that rename, just like an UP veth; this is
+reported as an error, not a skipped endpoint. Use `--mode=alternative` to add
+the requested name while retaining `eth0` (or the existing primary name).
+Neither mode creates a host-visible per-container interface. Applications or
+DHCP clients that depend on the original interface name may be affected by a
+successful primary rename; alternative mode avoids changing that name.
 
 ## Labels
 
@@ -224,13 +246,14 @@ Do not enable `PrivateNetwork`: that would hide the host interfaces.
 - Listens for container/network Docker events, coalesces bursts, and reconciles.
 - Reconnects after event-stream failures; full scans cover missed events,
   startup/attachment races, Docker restarts, and removals.
-- Matches each Docker endpoint's MAC address against `ip -j -d link` **inside
+- For bridge networks, matches each Docker endpoint's MAC address against `ip -j -d link` **inside
   the container network namespace**, then checks reciprocal peer indices,
   host veth type, and expected bridge membership. No `eth0` assumption or host
   sysfs lookup inside just a network namespace.
 - Supports the default bridge, custom Compose bridges, and explicit bridge
-  names. Host/shared network namespaces are excluded; non-bridge drivers
-  (overlay, macvlan, ipvlan, none) are not managed.
+  names, plus container-side naming for the macvlan networks described above.
+  Host/shared network namespaces are excluded; other drivers and DHCP plugin
+  modes (including overlay, ipvlan, and none) are not managed.
 - Revalidates the container PID/endpoint and both ends immediately before a
   change, checks primary and alternative-name collisions, and verifies the
   result afterward.
@@ -239,6 +262,10 @@ Do not enable `PrivateNetwork`: that would hide the host interfaces.
 - Logs errors as JSON to stderr/journald. Failed endpoints remain visible in
   the mapping snapshot and are retried on later scans. `--once` exits nonzero
   for any discovery, validation, rename, verification, or output error.
+- Logs each unchanged skipped endpoint only once per daemon run, rather than
+  on every scan. A changed mapping or an endpoint disappearing and returning
+  allows a new skip log. Skipped endpoints remain in every mapping snapshot;
+  restarting the daemon resets the log history.
 
 Docker and the kernel do not provide a single transaction spanning inspection,
 namespace entry, and renaming. Revalidation narrows races but cannot eliminate
@@ -246,7 +273,7 @@ the final check-to-operation window during concurrent endpoint destruction.
 There is also no exclusive lock against another copy of the daemon or another
 network manager. Run only one instance and avoid concurrent interface renamers.
 
-This is for local rootful Docker bridge networks, not Docker Desktop, rootless
+This is for local rootful Docker bridge and supported macvlan networks, not Docker Desktop, rootless
 Docker, Swarm overlay networking, remote Docker daemons, or Kubernetes.
 Monitoring/firewall/tc rules tied to an original primary name may need adjustment
 if a primary rename succeeds.
@@ -268,7 +295,11 @@ The systemd unit writes `/run/veth-renamer/mappings.json`. Each snapshot has
 `updated_at`, `mode`, `dry_run`, and a `mappings` array containing:
 
 - Container ID/name, Docker network ID/name, bridge, IPv4, and IPv6.
-- Current primary `interface`, host `ifindex`, and `requested_name`.
+- Current primary `interface`, `ifindex`, and `requested_name`.
+- `namespace`: `host` for bridge veths, `container` for macvlan interfaces.
+  Interface names and indices belong to that namespace; macvlan rows have an
+  empty `bridge`. The namespace may be absent when discovery fails or a driver
+  is unsupported.
 - `status`: `applied`, `unchanged`, `would-change`, `skipped`, or `error`.
 - An `error` explanation when applicable.
 

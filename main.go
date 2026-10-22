@@ -50,6 +50,23 @@ func main() {
 	}
 }
 
+func logEndpoints(log *slog.Logger, mappings []mapping, previousSkipped map[mapping]struct{}) map[mapping]struct{} {
+	skipped := make(map[mapping]struct{})
+	for _, m := range mappings {
+		if m.Status == "skipped" {
+			skipped[m] = struct{}{}
+			if _, seen := previousSkipped[m]; seen {
+				continue
+			}
+		}
+		if m.Status == "applied" || m.Status == "would-change" || m.Status == "skipped" {
+			log.Info("endpoint", "container", m.Container, "network", m.Network, "interface", m.Interface,
+				"namespace", m.Namespace, "requested_name", m.RequestedName, "status", m.Status, "detail", m.Error)
+		}
+	}
+	return skipped
+}
+
 func run(log *slog.Logger) error {
 	socket := flag.String("socket", "/var/run/docker.sock", "local rootful Docker Unix socket")
 	mode := flag.String("mode", "primary", "primary or alternative")
@@ -82,6 +99,7 @@ func run(log *slog.Logger) error {
 	defer cancel()
 	docker := newDocker(*socket)
 	r := reconciler{docker: docker, links: commandLinks{ip: ip, nsenter: nsenter}, mode: *mode, dryRun: *dryRun}
+	var skipped map[mapping]struct{}
 	reconcile := func() error {
 		result, scanErr := r.run(ctx)
 		if scanErr != nil {
@@ -91,12 +109,7 @@ func run(log *slog.Logger) error {
 		if scanErr != nil && len(result.Mappings) == 0 {
 			return scanErr
 		}
-		for _, m := range result.Mappings {
-			if m.Status == "applied" || m.Status == "would-change" || m.Status == "skipped" {
-				log.Info("endpoint", "container", m.Container, "network", m.Network, "interface", m.Interface,
-					"requested_name", m.RequestedName, "status", m.Status, "detail", m.Error)
-			}
-		}
+		skipped = logEndpoints(log, result.Mappings, skipped)
 		var outputErr error
 		if *mappingFile != "" {
 			outputErr = writeSnapshot(*mappingFile, result)

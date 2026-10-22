@@ -50,11 +50,13 @@ type fakeLinks struct {
 	hs         []link
 	inner      map[int][]link
 	calls      []string
+	applyPIDs  []int
 	hostErr    error
 	nsErr      error
 	applyErr   error
 	noMutation bool
 	hostHook   func(*fakeLinks)
+	nsHook     func(*fakeLinks, int)
 }
 
 func (l *fakeLinks) host(context.Context) ([]link, error) {
@@ -65,23 +67,31 @@ func (l *fakeLinks) host(context.Context) ([]link, error) {
 }
 
 func (l *fakeLinks) namespace(_ context.Context, pid int) ([]link, error) {
+	if l.nsHook != nil {
+		l.nsHook(l, pid)
+	}
 	return l.inner[pid], l.nsErr
 }
 
-func (l *fakeLinks) apply(_ context.Context, current, desired, mode string) error {
+func (l *fakeLinks) apply(_ context.Context, pid int, current, desired, mode string) error {
 	l.calls = append(l.calls, mode+":"+current+":"+desired)
+	l.applyPIDs = append(l.applyPIDs, pid)
 	if l.applyErr != nil {
 		return l.applyErr
 	}
 	if l.noMutation {
 		return nil
 	}
-	for i := range l.hs {
-		if l.hs[i].Name == current {
+	targets := l.hs
+	if pid > 0 {
+		targets = l.inner[pid]
+	}
+	for i := range targets {
+		if targets[i].Name == current {
 			if mode == "alternative" {
-				l.hs[i].AltNames = append(l.hs[i].AltNames, desired)
+				targets[i].AltNames = append(targets[i].AltNames, desired)
 			} else {
-				l.hs[i].Name = desired
+				targets[i].Name = desired
 			}
 			return nil
 		}
@@ -229,7 +239,8 @@ func TestReconcileModesAndIdempotency(t *testing.T) {
 				want = "veth_random"
 			}
 			m := result.Mappings[0]
-			if m.Interface != want || m.IfIndex != 42 || m.IPv4 != "172.18.0.2" || m.Container != "pihole" {
+			if m.Interface != want || m.IfIndex != 42 || m.IPv4 != "172.18.0.2" || m.Container != "pihole" ||
+				m.Namespace != "host" || len(l.applyPIDs) != 1 || l.applyPIDs[0] != 0 {
 				t.Fatalf("unexpected mapping: %+v", m)
 			}
 			result, err = r.run(context.Background())

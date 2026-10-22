@@ -19,6 +19,7 @@ type mapping struct {
 	Network       string `json:"network"`
 	NetworkID     string `json:"network_id"`
 	Bridge        string `json:"bridge"`
+	Namespace     string `json:"namespace,omitempty"`
 	IPv4          string `json:"ipv4"`
 	IPv6          string `json:"ipv6"`
 	Interface     string `json:"interface"`
@@ -46,6 +47,15 @@ type candidate struct {
 	record int
 	c      container
 	ep     endpoint
+	pid    int
+	parent string
+}
+
+func (p candidate) target(inner, host []link, bridge string) (link, error) {
+	if p.pid > 0 {
+		return findMacvlan(inner, host, p.ep.MacAddress, p.parent)
+	}
+	return findPeer(inner, host, p.ep.MacAddress, bridge)
 }
 
 func validName(name string) error {
@@ -162,17 +172,25 @@ func (r reconciler) run(ctx context.Context) (snapshot, error) {
 				fail(i, err)
 				continue
 			}
-			if n.Driver != "bridge" {
+			plan := candidate{record: i, c: c, ep: ep}
+			switch {
+			case n.Driver == "bridge":
+				bridge, err := bridgeName(n)
+				if err != nil {
+					fail(i, err)
+					continue
+				}
+				result.Mappings[i].Bridge = bridge
+				result.Mappings[i].Namespace = "host"
+			case n.Driver == "macvlan" ||
+				(strings.HasPrefix(n.Driver, "ghcr.io/claymore666/docker-net-dhcp:") && n.Options["mode"] == "macvlan"):
+				plan.pid, plan.parent = c.State.Pid, n.Options["parent"]
+				result.Mappings[i].Namespace = "container"
+			default:
 				result.Mappings[i].Status = "skipped"
 				result.Mappings[i].Error = "unsupported network driver: " + n.Driver
 				continue
 			}
-			bridge, err := bridgeName(n)
-			if err != nil {
-				fail(i, err)
-				continue
-			}
-			result.Mappings[i].Bridge = bridge
 			if !loaded {
 				inner, innerErr = r.links.namespace(ctx, c.State.Pid)
 				loaded = true
@@ -181,13 +199,13 @@ func (r reconciler) run(ctx context.Context) (snapshot, error) {
 				fail(i, innerErr)
 				continue
 			}
-			h, err := findPeer(inner, host, ep.MacAddress, bridge)
+			h, err := plan.target(inner, host, result.Mappings[i].Bridge)
 			if err != nil {
 				fail(i, err)
 				continue
 			}
 			result.Mappings[i].Interface, result.Mappings[i].IfIndex = h.Name, h.Index
-			candidates = append(candidates, candidate{record: i, c: c, ep: ep})
+			candidates = append(candidates, plan)
 		}
 	}
 	claims := map[string]int{}
@@ -216,6 +234,7 @@ func (r reconciler) apply(ctx context.Context, plan candidate, m *mapping) error
 	}
 	ep, ok := current.NetworkSettings.Networks[m.Network]
 	if !current.State.Running || current.State.Pid != plan.c.State.Pid || !ok ||
+		current.HostConfig.NetworkMode != plan.c.HostConfig.NetworkMode ||
 		ep.EndpointID != plan.ep.EndpointID || ep.NetworkID != plan.ep.NetworkID ||
 		ep.MacAddress != plan.ep.MacAddress {
 		return fmt.Errorf("container endpoint changed during reconciliation; will retry")
@@ -228,14 +247,18 @@ func (r reconciler) apply(ctx context.Context, plan candidate, m *mapping) error
 	if err != nil {
 		return err
 	}
-	h, err := findPeer(inner, host, ep.MacAddress, m.Bridge)
+	h, err := plan.target(inner, host, m.Bridge)
 	if err != nil {
 		return err
 	}
 	if h.Index != m.IfIndex || h.Name != m.Interface {
-		return fmt.Errorf("host interface changed during reconciliation; will retry")
+		return fmt.Errorf("%s interface changed during reconciliation; will retry", m.Namespace)
 	}
-	for _, other := range host {
+	available := host
+	if plan.pid > 0 {
+		available = inner
+	}
+	for _, other := range available {
 		if ownsName(other, m.RequestedName) && other.Index != h.Index {
 			return fmt.Errorf("name %q is already owned by interface %q", m.RequestedName, other.Name)
 		}
@@ -251,15 +274,21 @@ func (r reconciler) apply(ctx context.Context, plan candidate, m *mapping) error
 		m.Status = "would-change"
 		return nil
 	}
-	if err := r.links.apply(ctx, h.Name, m.RequestedName, r.mode); err != nil {
+	if err := r.links.apply(ctx, plan.pid, h.Name, m.RequestedName, r.mode); err != nil {
 		return fmt.Errorf("apply %s name (links are never taken down; UP links commonly reject primary renames): %w", r.mode, err)
 	}
-	after, err := r.links.host(ctx)
+	var after []link
+	if plan.pid > 0 {
+		after, err = r.links.namespace(ctx, plan.pid)
+	} else {
+		after, err = r.links.host(ctx)
+	}
 	if err != nil {
 		return fmt.Errorf("name command succeeded but verification failed: %w", err)
 	}
 	for _, changed := range after {
-		if changed.Index == h.Index && changed.Peer == h.Peer && changed.Master == h.Master && changed.Info.Kind == "veth" &&
+		if changed.Index == h.Index && changed.Peer == h.Peer && changed.Master == h.Master &&
+			changed.Info.Kind == h.Info.Kind && strings.EqualFold(changed.Address, h.Address) &&
 			(r.mode == "primary" && changed.Name == m.RequestedName || r.mode == "alternative" && ownsName(changed, m.RequestedName)) {
 			m.Interface, m.Status = changed.Name, "applied"
 			return nil
