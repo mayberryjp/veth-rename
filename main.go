@@ -67,6 +67,13 @@ func logEndpoints(log *slog.Logger, mappings []mapping, previousSkipped map[mapp
 	return skipped
 }
 
+func logScanError(log *slog.Logger, err, previous error) error {
+	if err != nil && (previous == nil || err.Error() != previous.Error()) {
+		log.Error("scan failed; daemon will retry", "error", err)
+	}
+	return err
+}
+
 func run(log *slog.Logger) error {
 	socket := flag.String("socket", "/var/run/docker.sock", "local rootful Docker Unix socket")
 	mode := flag.String("mode", "primary", "primary or alternative")
@@ -102,9 +109,6 @@ func run(log *slog.Logger) error {
 	var skipped map[mapping]struct{}
 	reconcile := func() error {
 		result, scanErr := r.run(ctx)
-		if scanErr != nil {
-			log.Error("reconciliation incomplete", "error", scanErr)
-		}
 		// A top-level discovery failure must not overwrite the last useful snapshot.
 		if scanErr != nil && len(result.Mappings) == 0 {
 			return scanErr
@@ -124,9 +128,11 @@ func run(log *slog.Logger) error {
 	}
 	changes := make(chan struct{}, 1)
 	go docker.watch(ctx, changes, log)
-	if err := reconcile(); err != nil {
-		log.Error("initial scan failed; daemon will retry", "error", err)
+	var previousError error
+	scan := func() {
+		previousError = logScanError(log, reconcile(), previousError)
 	}
+	scan()
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 	for {
@@ -144,8 +150,6 @@ func run(log *slog.Logger) error {
 			case <-timer.C:
 			}
 		}
-		if err := reconcile(); err != nil {
-			log.Error("scan failed; daemon will retry", "error", err)
-		}
+		scan()
 	}
 }

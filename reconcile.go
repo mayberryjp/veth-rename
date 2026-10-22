@@ -277,7 +277,8 @@ func (r reconciler) apply(ctx context.Context, plan candidate, m *mapping) error
 	}
 	for _, other := range available {
 		if ownsName(other, m.RequestedName) && other.Index != h.Index {
-			return fmt.Errorf("name %q is already owned by interface %q", m.RequestedName, other.Name)
+			return fmt.Errorf("name %q is already owned by interface %q (ifindex %d); target is %q (ifindex %d)",
+				m.RequestedName, other.Name, other.Index, h.Name, h.Index)
 		}
 	}
 	if h.Name == m.RequestedName || r.mode == "alternative" && ownsName(h, m.RequestedName) {

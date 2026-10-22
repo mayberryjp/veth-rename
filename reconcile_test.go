@@ -341,6 +341,22 @@ func TestDuplicateClaimsRefuseBoth(t *testing.T) {
 	}
 }
 
+func TestNameCollisionIdentifiesBothInterfaces(t *testing.T) {
+	for _, mode := range []string{"primary", "alternative"} {
+		t.Run(mode, func(t *testing.T) {
+			_, l, r := fixture()
+			r.mode = mode
+			l.hs = append(l.hs, link{Index: 99, Name: "veth_pihole"})
+			result, err := r.run(context.Background())
+			want := `interface "veth_pihole" (ifindex 99); target is "veth_random" (ifindex 42)`
+			if err == nil || !strings.Contains(err.Error(), want) ||
+				result.Mappings[0].Status != "error" || len(l.calls) != 0 {
+				t.Fatalf("collision not safely diagnosed: %+v %v calls=%v", result, err, l.calls)
+			}
+		})
+	}
+}
+
 func TestMultiNetworkOverrides(t *testing.T) {
 	d, l, r := fixture()
 	c := d.cs["c1"]

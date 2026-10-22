@@ -2,11 +2,77 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
 )
+
+func TestLogScanErrorDeduplicatesFailures(t *testing.T) {
+	var output bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&output, nil))
+	var previous error
+	message := "app/lan: name already owned\nother/lan: rename refused"
+	for i := 0; i < 1000; i++ {
+		previous = logScanError(log, errors.New(message), previous)
+	}
+	assertScanErrorLog(t, &output, message)
+	if previous == nil || previous.Error() != message {
+		t.Fatalf("failure state = %v, want %q", previous, message)
+	}
+	previous = logScanError(log, errors.New("different failure"), previous)
+	assertScanErrorLog(t, &output, "different failure")
+	previous = logScanError(log, nil, previous)
+	if previous != nil || output.Len() != 0 {
+		t.Fatal("successful scan did not quietly clear failure state")
+	}
+	previous = logScanError(log, errors.New(message), previous)
+	assertScanErrorLog(t, &output, message)
+	logScanError(log, errors.New(message), previous)
+	if output.Len() != 0 {
+		t.Fatalf("repeated failure logged: %s", output.String())
+	}
+	logScanError(log, errors.New(""), nil)
+	assertScanErrorLog(t, &output, "")
+}
+
+func assertScanErrorLog(t *testing.T, output *bytes.Buffer, want string) {
+	t.Helper()
+	decoder := json.NewDecoder(output)
+	var got map[string]string
+	if err := decoder.Decode(&got); err != nil {
+		t.Fatalf("missing error log: %v", err)
+	}
+	if got["level"] != "ERROR" || got["msg"] != "scan failed; daemon will retry" || got["error"] != want {
+		t.Fatalf("incorrect error log: %+v", got)
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		t.Fatalf("expected exactly one error log; extra=%s err=%v", extra, err)
+	}
+	output.Reset()
+}
+
+func TestRepeatedFailedScansKeepRetrying(t *testing.T) {
+	_, links, r := fixture()
+	links.applyErr = errors.New("Device or resource busy")
+	var output bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&output, nil))
+	var previous error
+	for i := 0; i < 25; i++ {
+		result, err := r.run(context.Background())
+		if err == nil || len(result.Mappings) != 1 || result.Mappings[0].Status != "error" {
+			t.Fatalf("failed endpoint missing from scan: %+v %v", result, err)
+		}
+		previous = logScanError(log, err, previous)
+	}
+	if len(links.calls) != 25 {
+		t.Fatalf("got %d attempts, want 25", len(links.calls))
+	}
+	assertScanErrorLog(t, &output, previous.Error())
+}
 
 func TestLogEndpointsDeduplicatesSkipped(t *testing.T) {
 	base := mapping{

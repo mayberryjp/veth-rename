@@ -270,6 +270,10 @@ Do not enable `PrivateNetwork`: that would hide the host interfaces.
 - Logs errors as JSON to stderr/journald. Failed endpoints remain visible in
   the mapping snapshot and are retried on later scans. `--once` exits nonzero
   for any discovery, validation, rename, verification, or output error.
+- Logs an identical scan failure only once, without duplicate reconciliation
+  and retry messages. A changed failure or a failure recurring after a
+  successful scan is logged again. Retries and snapshot updates continue
+  even when repeat messages are suppressed. Restarting resets this history.
 - Logs each unchanged skipped endpoint only once per daemon run, rather than
   on every scan. A changed mapping or an endpoint disappearing and returning
   allows a new skip log. Skipped endpoints remain in every mapping snapshot;
