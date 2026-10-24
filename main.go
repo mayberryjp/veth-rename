@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -77,7 +78,7 @@ func logScanError(log *slog.Logger, err, previous error) error {
 
 func run(log *slog.Logger) error {
 	socket := flag.String("socket", "/var/run/docker.sock", "local rootful Docker Unix socket")
-	mode := flag.String("mode", "auto", "auto (alternative names with vnStat collision fallback), primary or alternative")
+	mode := flag.String("mode", "primary-repair", "primary-repair (brief host-veth interruption), auto, primary or alternative")
 	vnstat := flag.String("vnstat", "auto", "auto-detect vnStat, off, or path to a vnStat 2.x executable")
 	interval := flag.Duration("interval", 30*time.Second, "full reconciliation interval (at least 1s)")
 	mappingFile := flag.String("mapping-file", "", "atomic JSON snapshot path; parent directory must exist")
@@ -87,14 +88,21 @@ func run(log *slog.Logger) error {
 	if flag.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments")
 	}
-	if *mode != "auto" && *mode != "primary" && *mode != "alternative" {
-		return fmt.Errorf("mode must be auto, primary or alternative")
+	if *mode != "primary-repair" && *mode != "auto" && *mode != "primary" && *mode != "alternative" {
+		return fmt.Errorf("mode must be primary-repair, auto, primary or alternative")
 	}
 	if *interval < time.Second {
 		return fmt.Errorf("interval must be at least 1s")
 	}
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("this daemon must run directly on a Linux Docker host")
+	}
+	if !*dryRun {
+		lock, err := net.Listen("unix", "@veth-renamer-interface-owner")
+		if err != nil {
+			return fmt.Errorf("another interface renamer instance may be running: %w", err)
+		}
+		defer lock.Close()
 	}
 	ip, err := exec.LookPath("ip")
 	if err != nil {
@@ -106,6 +114,9 @@ func run(log *slog.Logger) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	if *mode == "primary-repair" && !*dryRun {
+		log.Warn("controlled primary repair enabled; verified managed host veths may be briefly taken DOWN and restored UP")
+	}
 	docker := newDocker(*socket)
 	r := reconciler{docker: docker, links: commandLinks{ip: ip, nsenter: nsenter}, mode: *mode, dryRun: *dryRun}
 	if *vnstat != "off" {

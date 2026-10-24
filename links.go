@@ -17,6 +17,9 @@ type link struct {
 	Address  string   `json:"address"`
 	Master   string   `json:"master"`
 	AltNames []string `json:"altnames"`
+	PeerName string   `json:"link"`
+	Flags    []string `json:"flags"`
+	NetNSID  *int     `json:"link_netnsid"`
 	Info     struct {
 		Kind string `json:"info_kind"`
 	} `json:"linkinfo"`
@@ -80,6 +83,53 @@ func (l commandLinks) nameCommand(pid int, current, desired, mode string) (strin
 func (l commandLinks) apply(ctx context.Context, pid int, current, desired, mode string) error {
 	program, args := l.nameCommand(pid, current, desired, mode)
 	_, err := command(ctx, program, args...)
+	return err
+}
+
+func sameLink(current, expected link) bool {
+	return current.Index == expected.Index && current.Name == expected.Name &&
+		current.Peer == expected.Peer && current.PeerName == expected.PeerName &&
+		current.Master == expected.Master && current.Info.Kind == expected.Info.Kind &&
+		strings.EqualFold(current.Address, expected.Address)
+}
+
+func (l commandLinks) change(ctx context.Context, expected link, action, value string) error {
+	links, err := l.host(ctx)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, current := range links {
+		if sameLink(current, expected) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("interface identity changed before %s %q; refusing mutation", action, value)
+	}
+	var args []string
+	switch action {
+	case "state":
+		if value != "up" && value != "down" {
+			return fmt.Errorf("invalid link state %q", value)
+		}
+		args = []string{"link", "set", "dev", expected.Name, value}
+	case "name":
+		if err := validName(value); err != nil {
+			return err
+		}
+		args = []string{"link", "set", "dev", expected.Name, "name", value}
+	case "del-altname", "add-altname":
+		verb := "del"
+		if action == "add-altname" {
+			verb = "add"
+		}
+		args = []string{"link", "property", verb, "dev", expected.Name, "altname", value}
+	default:
+		return fmt.Errorf("unsupported repair operation %q", action)
+	}
+	_, err = command(ctx, l.ip, args...)
 	return err
 }
 

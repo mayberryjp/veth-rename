@@ -21,6 +21,10 @@ jobs:
           cache: false
       - run: go test -race ./...
       - run: go vet ./...
+      - name: Test controlled interface repair in an isolated network namespace
+        run: |
+          go test -c -o "$RUNNER_TEMP/veth-renamer.test" .
+          sudo env PRIMARY_REPAIR_INTEGRATION=1 "$RUNNER_TEMP/veth-renamer.test" -test.run '^TestPrimaryRepairKernelIntegration$' -test.v
       - name: Validate shell scripts
         run: |
           for script in install.sh tests/*.sh; do bash -n "$script"; done

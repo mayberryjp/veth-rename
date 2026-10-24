@@ -48,11 +48,12 @@ type reconciler struct {
 }
 
 type candidate struct {
-	record int
-	c      container
-	ep     endpoint
-	pid    int
-	parent string
+	record     int
+	c          container
+	ep         endpoint
+	pid        int
+	parent     string
+	dhcpBridge bool
 }
 
 func (p candidate) target(inner, host []link, bridge string) (link, error) {
@@ -204,6 +205,7 @@ func (r reconciler) run(ctx context.Context) (snapshot, error) {
 				}
 				result.Mappings[i].Bridge = bridge
 				result.Mappings[i].Namespace = "host"
+				plan.dhcpBridge = n.Driver != "bridge"
 			case "macvlan":
 				plan.pid, plan.parent = c.State.Pid, n.Options["parent"]
 				result.Mappings[i].Namespace = "container"
@@ -278,12 +280,87 @@ func (r reconciler) apply(ctx context.Context, plan candidate, m *mapping) error
 	if h.Index != m.IfIndex || h.Name != m.Interface {
 		return fmt.Errorf("%s interface changed during reconciliation; will retry", m.Namespace)
 	}
+	if r.mode == "primary-repair" && plan.pid == 0 {
+		backend, ok := r.links.(repairAPI)
+		if !ok {
+			return fmt.Errorf("link backend does not support controlled primary repair")
+		}
+		var stale *link
+		staleName := ""
+		for _, other := range host {
+			if !ownsName(other, m.RequestedName) || other.Index == h.Index {
+				continue
+			}
+			if !plan.dhcpBridge || other.Name != m.RequestedName || stale != nil {
+				return fmt.Errorf("name %q belongs to another interface; refusing unsafe repair", m.RequestedName)
+			}
+			staleName, err = staleDHCPName(host, h, other, ep.MacAddress)
+			if err != nil {
+				return fmt.Errorf("name %q: %w", m.RequestedName, err)
+			}
+			copy := other
+			stale = &copy
+		}
+		validate := func(ctx context.Context, expected link) error {
+			latest, err := r.docker.inspect(ctx, plan.c.ID)
+			if err != nil {
+				return err
+			}
+			endpoint, exists := latest.NetworkSettings.Networks[m.Network]
+			if !latest.State.Running || latest.State.Pid != current.State.Pid || !exists ||
+				latest.HostConfig.NetworkMode != current.HostConfig.NetworkMode || endpoint != ep {
+				return fmt.Errorf("container endpoint changed during primary repair")
+			}
+			inside, err := r.links.namespace(ctx, current.State.Pid)
+			if err != nil {
+				return err
+			}
+			outside, err := r.links.host(ctx)
+			if err != nil {
+				return err
+			}
+			actual, err := plan.target(inside, outside, m.Bridge)
+			if err != nil || !sameLink(actual, expected) {
+				return fmt.Errorf("live peer identity changed during primary repair: %v", err)
+			}
+			return nil
+		}
+		if h.Name == m.RequestedName && hasFlag(h, "UP") {
+			m.Status = "unchanged"
+			return nil
+		}
+		if len(h.Flags) == 0 {
+			return fmt.Errorf("interface flags unavailable; refusing primary repair")
+		}
+		if r.dryRun {
+			m.Status = "would-change"
+			return nil
+		}
+		if !hasFlag(h, "UP") {
+			h.Flags = append(append([]string{}, h.Flags...), "UP")
+		}
+		changed, err := repairPrimary(ctx, backend, h, m.RequestedName, stale, staleName, ep.MacAddress, validate)
+		if err != nil {
+			return fmt.Errorf("controlled primary repair: %w", err)
+		}
+		outside, err := r.links.host(ctx)
+		if err != nil {
+			return err
+		}
+		for _, actual := range outside {
+			if sameLink(actual, changed) && hasFlag(actual, "UP") {
+				m.Interface, m.Status = changed.Name, "applied"
+				return nil
+			}
+		}
+		return fmt.Errorf("primary name applied but UP state was not verified; will retry")
+	}
 	available := host
 	if plan.pid > 0 {
 		available = inner
 	}
 	mode := r.mode
-	if mode == "auto" {
+	if mode == "auto" || mode == "primary-repair" {
 		mode = "alternative"
 	}
 	for _, other := range available {

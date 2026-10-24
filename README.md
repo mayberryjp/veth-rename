@@ -2,14 +2,51 @@
 
 A small, dependency-free Go daemon for **rootful Docker Engine on an Ubuntu
 host**. It reads container labels, finds the matching host-side bridge veth,
-and applies an alternative interface name by default. It also names macvlan
+and repairs its actual primary interface name by default. It also names macvlan
 interfaces inside container network namespaces. Unlabeled containers are
 never renamed. When vnStat 2.x is installed, it also registers verified live
 host interfaces and maintains readable vnStat aliases automatically.
 
-## Automatic monitoring repair
+## Controlled primary-name repair
 
-The default `--mode=auto` never attempts a primary rename. It adds an
+The default `--mode=primary-repair` gives the verified live host veth the
+requested **kernel primary name**, not just an alternative name or vnStat
+alias. For example, traffic for the labeled container flows through
+`veth_youtube`, and `vnstat -i veth_youtube --days` selects that live interface.
+
+**This mode briefly interrupts each affected container's networking.** Linux
+usually rejects renaming an UP link, so the daemon lowers only that verified
+host veth, renames it, restores UP, and checks the endpoint, ifindex, MAC,
+bridge, peer, primary name, and administrative state. Ordinary failures and
+cancellation trigger rollback with a separate bounded recovery context.
+A later scan also brings the verified managed peer UP if an abrupt process
+death left it DOWN. An interruption cannot be made atomic against SIGKILL,
+host failure, or a concurrent external network manager.
+
+If a disconnected DHCP pair occupies the requested name, reclamation requires
+both reciprocal ends to be visible in the host namespace, the bridge to match,
+the detached peer to be administratively DOWN with the Docker endpoint MAC,
+and its name to match the plugin's `<12 hex digits>-dh` convention. The bridge
+end must be disconnected. The daemon restores that stale bridge end's original
+`dh-<12 hex digits>` name rather than deleting the pair, then names the live
+peer. It rechecks identity before mutations and rejects live or ambiguous
+collisions, occupied restoration names, duplicate labels, and endpoint races.
+Shared bridges, VLANs, physical NICs, and container-side links are never lowered
+by this repair. New or recreated labeled endpoints are reconciled automatically.
+
+Deploy the matching binary and systemd unit together. The packaged unit uses
+`--mode=primary-repair`; remove old mode overrides if you want the new default.
+The `--dry-run` flag reports planned repairs without changing links or vnStat.
+Successful repair retains the interface index, MAC, and bridge. The daemon
+does not configure addresses or routes.
+vnStat registration and aliases are reconciled using the resulting primary
+name; historical rows are not deleted or merged. DHCP plugins may still leave
+detached pairs during teardown after a primary rename; subsequent scans handle
+proven stale-name collisions using the same rules instead of deleting links.
+
+## Non-disruptive naming and monitoring
+
+The optional `--mode=auto` never attempts a primary rename. It adds an
 alternative name when available and synchronizes vnStat using the actual
 kernel primary name, not the alternative name. On every scan it detects
 missing registrations or incorrect aliases and repairs them, including after
@@ -25,9 +62,9 @@ Without vnStat installed, name conflicts remain errors rather than being
 reported as repaired.
 
 Deploy the new binary **and** updated systemd unit, then reload systemd and
-restart `veth-renamer.service`. The packaged unit uses auto mode and starts
-after vnStat. Remove any local `--mode=primary` override to opt into auto
-repair. Explicit primary/alternative modes retain strict naming behavior.
+restart `veth-renamer.service`. The packaged unit starts after vnStat.
+Explicit primary/alternative modes retain strict naming behavior; primary
+mode does not take links down and can still fail on an UP device.
 vnStat must already be installed; vnstatd initializes and collects into its
 database. Startup/database failures remain visible and are retried.
 Use `--vnstat=off` to disable integration or `--vnstat=/path/to/vnstat` to
@@ -37,7 +74,7 @@ not registered in the host's vnStat database.
 Traffic history is never removed, renamed, or merged. Old rows remain for
 historical reporting; aliases do not combine history across recreated
 interfaces or change the kernel name used with `vnstat -i`. This repairs
-ongoing monitoring without interrupting container networking, rather than
+ongoing monitoring in auto mode without interrupting container networking, rather than
 attempting unsafe live renames or guessing which old links can be deleted.
 The unit permits writes to `/var/lib/vnstat` and includes `CAP_DAC_OVERRIDE`
 to update a database owned by the vnstat account. Sites using a custom
@@ -46,8 +83,8 @@ database directory must add that directory to the unit's `ReadWritePaths`.
 ## Important correction to the original proposal
 
 **Do not assume an active veth can be renamed.** Linux normally rejects primary
-interface renames while a device is UP (`Device or resource busy`). This service
-never brings interfaces down, retries with downtime, or changes firewall rules.
+interface renames while a device is UP (`Device or resource busy`). Strict
+`--mode=primary` never brings interfaces down or retries with downtime.
 Consequently, **primary mode will commonly report errors instead of renaming
 running Docker interfaces**. Primary mode is an explicit opt-in, not a
 guarantee of live renaming.
@@ -62,10 +99,9 @@ depends on the tool/version: test your actual tcpdump, SNMP agent, and monitorin
 stack. An alternative name does **not** change the primary name shown by all
 tools.
 
-If primary names are essential and your kernel rejects the rename, applying them
-requires a different deployment strategy that names links before they are UP,
-or an explicitly scheduled interruption outside this service. This daemon does
-not provide that strategy.
+Use the default primary-repair mode only when its controlled interruption is
+acceptable. For zero-interruption requirements, choose auto or alternative
+mode and do not expect `vnstat -i` to resolve an alternative name or alias.
 
 ## Macvlan and docker-net-dhcp networks
 
@@ -85,7 +121,8 @@ Macvlan has no host-side veth peer. For these networks, the same labels and
 `--mode` setting apply to the MAC-matched macvlan interface **inside the
 container's network namespace**, not to the shared host parent. The daemon
 validates the kernel link type and parent index before changing anything.
-It never renames the host VLAN or physical interface.
+It never renames the host VLAN or physical interface. Primary-repair mode uses
+alternative naming for macvlan; it does not interrupt container-side links.
 
 Primary mode attempts a primary rename without bringing the interface down.
 An UP macvlan interface can reject that rename, just like an UP veth; this is
@@ -179,8 +216,8 @@ curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-rename/main/install
 ```
 
 `--start` enables and restarts the service, including on upgrades, so the newly
-installed binary is used. The default naming mode remains **primary**, with the
-UP-link limitation described above. Set a systemd override if you prefer
+installed binary is used. The default naming mode is **primary-repair**, with
+the controlled interruption described above. Set a systemd override if you prefer
 alternative names.
 
 For reproducible installs, pin both the script and package to a release:
@@ -238,7 +275,7 @@ CGO_ENABLED=0 go build -trimpath -o bin/veth-renamer .
 # Read-only preview: no interface changes.
 sudo ./bin/veth-renamer --once --dry-run
 
-# Attempt primary names; a busy/UP link is an explicit error and nonzero exit.
+# Repair actual primary names, briefly interrupting the affected host veth.
 sudo ./bin/veth-renamer --once
 
 # Non-disruptive alternative naming.
@@ -260,7 +297,7 @@ sudo systemctl enable --now veth-renamer
 sudo journalctl -u veth-renamer -f
 ```
 
-The supplied unit uses **primary mode**. To use alternative names:
+The supplied unit uses **primary-repair mode**. To use alternative names:
 
 ```bash
 sudo systemctl edit veth-renamer
@@ -302,8 +339,9 @@ Do not enable `PrivateNetwork`: that would hide the host interfaces.
 - Revalidates the container PID/endpoint and both ends immediately before a
   change, checks primary and alternative-name collisions, and verifies the
   result afterward.
-- Refuses all endpoints that request the same name. Does not evict names,
-  rename unrelated interfaces, swap names, or bring links down.
+- Refuses all endpoints that request the same name. Only primary-repair mode
+  lowers verified host veths and reclaims proven disconnected DHCP names;
+  other modes never lower links. Unrelated names and interfaces are not changed.
 - Logs errors as JSON to stderr/journald. Failed endpoints remain visible in
   the mapping snapshot and are retried on later scans. `--once` exits nonzero
   for any discovery, validation, rename, verification, or output error.
@@ -319,8 +357,9 @@ Do not enable `PrivateNetwork`: that would hide the host interfaces.
 Docker and the kernel do not provide a single transaction spanning inspection,
 namespace entry, and renaming. Revalidation narrows races but cannot eliminate
 the final check-to-operation window during concurrent endpoint destruction.
-There is also no exclusive lock against another copy of the daemon or another
-network manager. Run only one instance and avoid concurrent interface renamers.
+An abstract Unix socket prevents simultaneous mutating instances of this
+daemon. Dry-run previews can coexist. External network managers do not honor
+that lock, so avoid concurrent interface renamers.
 
 This is for local rootful Docker bridge and supported macvlan networks, not Docker Desktop, rootless
 Docker, Swarm overlay networking, remote Docker daemons, or Kubernetes.
@@ -332,7 +371,7 @@ if a primary rename succeeds.
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--socket` | `/var/run/docker.sock` | Local Docker Unix socket |
-| `--mode` | `auto` | Safe alternative naming with vnStat fallback; `primary`/`alternative` retain strict naming |
+| `--mode` | `primary-repair` | Controlled host-veth interruption and primary-name repair; `auto`/`alternative` avoid downtime; `primary` is strict |
 | `--vnstat` | `auto` | Detect vnStat 2.x if installed; `off` disables, or provide an executable path |
 | `--interval` | `30s` | Full scan interval, at least `1s` |
 | `--mapping-file` | disabled | Atomic JSON snapshot; parent directory must exist |
@@ -397,6 +436,10 @@ On Linux with vnStat 2.x installed, run the isolated real-CLI check with
 `VNSTAT_INTEGRATION=1 go test -run TestVNStatCLIIntegration -v`.
 It uses only temporary configuration/database files, does not change links,
 and does not access the production vnStat database.
+The release gate additionally runs `TestPrimaryRepairKernelIntegration` as
+root with `PRIMARY_REPAIR_INTEGRATION=1`. It creates its own disposable network
+namespace and exercises real bridge/veth naming, reclamation, and rollback
+without altering host interfaces.
 
 ## Publishing releases
 
