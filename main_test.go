@@ -148,6 +148,19 @@ func TestLogEndpointsPreservesOtherLogging(t *testing.T) {
 	assertEndpointLogs(t, &output, mappings[:2])
 }
 
+func TestLogEndpointsDeduplicatesMonitored(t *testing.T) {
+	var output bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&output, nil))
+	record := mapping{Status: "monitored", Interface: "dh-live", RequestedName: "veth_app", NamingWarning: "name occupied", VNStatStatus: "unchanged"}
+	previous := logEndpoints(log, []mapping{record}, nil)
+	assertEndpointLogs(t, &output, []mapping{record})
+	logEndpoints(log, []mapping{record}, previous)
+	assertEndpointLogs(t, &output, nil)
+	record.Interface = "dh-recreated"
+	logEndpoints(log, []mapping{record}, previous)
+	assertEndpointLogs(t, &output, []mapping{record})
+}
+
 func assertEndpointLogs(t *testing.T, output *bytes.Buffer, want []mapping) {
 	t.Helper()
 	decoder := json.NewDecoder(output)

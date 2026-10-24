@@ -27,6 +27,9 @@ type mapping struct {
 	RequestedName string `json:"requested_name"`
 	Status        string `json:"status"`
 	Error         string `json:"error,omitempty"`
+	NamingWarning string `json:"naming_warning,omitempty"`
+	VNStatStatus  string `json:"vnstat_status,omitempty"`
+	VNStatError   string `json:"vnstat_error,omitempty"`
 }
 
 type snapshot struct {
@@ -41,6 +44,7 @@ type reconciler struct {
 	links  linkAPI
 	mode   string
 	dryRun bool
+	vnstat *vnstatClient
 }
 
 type candidate struct {
@@ -241,6 +245,9 @@ func (r reconciler) run(ctx context.Context) (snapshot, error) {
 			fail(plan.record, err)
 		}
 	}
+	if r.vnstat != nil {
+		problems = append(problems, r.vnstat.sync(ctx, result.Mappings, r.dryRun))
+	}
 	return result, errors.Join(problems...)
 }
 
@@ -275,13 +282,22 @@ func (r reconciler) apply(ctx context.Context, plan candidate, m *mapping) error
 	if plan.pid > 0 {
 		available = inner
 	}
+	mode := r.mode
+	if mode == "auto" {
+		mode = "alternative"
+	}
 	for _, other := range available {
 		if ownsName(other, m.RequestedName) && other.Index != h.Index {
+			if r.mode == "auto" && plan.pid == 0 && r.vnstat != nil {
+				m.Status = "monitored"
+				m.NamingWarning = fmt.Sprintf("name %q is owned by interface %q (ifindex %d); monitoring live interface %q without modifying the conflicting link", m.RequestedName, other.Name, other.Index, h.Name)
+				return nil
+			}
 			return fmt.Errorf("name %q is already owned by interface %q (ifindex %d); target is %q (ifindex %d)",
 				m.RequestedName, other.Name, other.Index, h.Name, h.Index)
 		}
 	}
-	if h.Name == m.RequestedName || r.mode == "alternative" && ownsName(h, m.RequestedName) {
+	if h.Name == m.RequestedName || mode == "alternative" && ownsName(h, m.RequestedName) {
 		m.Status = "unchanged"
 		return nil
 	}
@@ -292,7 +308,11 @@ func (r reconciler) apply(ctx context.Context, plan candidate, m *mapping) error
 		m.Status = "would-change"
 		return nil
 	}
-	if err := r.links.apply(ctx, plan.pid, h.Name, m.RequestedName, r.mode); err != nil {
+	if err := r.links.apply(ctx, plan.pid, h.Name, m.RequestedName, mode); err != nil {
+		if r.mode == "auto" && plan.pid == 0 && r.vnstat != nil {
+			m.Status, m.NamingWarning = "monitored", fmt.Sprintf("alternative naming failed; monitoring live interface instead: %v", err)
+			return nil
+		}
 		return fmt.Errorf("apply %s name (links are never taken down; UP links commonly reject primary renames): %w", r.mode, err)
 	}
 	var after []link
@@ -307,7 +327,7 @@ func (r reconciler) apply(ctx context.Context, plan candidate, m *mapping) error
 	for _, changed := range after {
 		if changed.Index == h.Index && changed.Peer == h.Peer && changed.Master == h.Master &&
 			changed.Info.Kind == h.Info.Kind && strings.EqualFold(changed.Address, h.Address) &&
-			(r.mode == "primary" && changed.Name == m.RequestedName || r.mode == "alternative" && ownsName(changed, m.RequestedName)) {
+			(mode == "primary" && changed.Name == m.RequestedName || mode == "alternative" && ownsName(changed, m.RequestedName)) {
 			m.Interface, m.Status = changed.Name, "applied"
 			return nil
 		}

@@ -53,15 +53,16 @@ func main() {
 func logEndpoints(log *slog.Logger, mappings []mapping, previousSkipped map[mapping]struct{}) map[mapping]struct{} {
 	skipped := make(map[mapping]struct{})
 	for _, m := range mappings {
-		if m.Status == "skipped" {
+		if m.Status == "skipped" || m.Status == "monitored" {
 			skipped[m] = struct{}{}
 			if _, seen := previousSkipped[m]; seen {
 				continue
 			}
 		}
-		if m.Status == "applied" || m.Status == "would-change" || m.Status == "skipped" {
+		if m.Status == "applied" || m.Status == "would-change" || m.Status == "skipped" || m.Status == "monitored" || m.VNStatStatus == "applied" || m.VNStatStatus == "would-change" {
 			log.Info("endpoint", "container", m.Container, "network", m.Network, "interface", m.Interface,
-				"namespace", m.Namespace, "requested_name", m.RequestedName, "status", m.Status, "detail", m.Error)
+				"namespace", m.Namespace, "requested_name", m.RequestedName, "status", m.Status, "detail", m.Error,
+				"naming_warning", m.NamingWarning, "vnstat_status", m.VNStatStatus, "vnstat_error", m.VNStatError)
 		}
 	}
 	return skipped
@@ -76,7 +77,8 @@ func logScanError(log *slog.Logger, err, previous error) error {
 
 func run(log *slog.Logger) error {
 	socket := flag.String("socket", "/var/run/docker.sock", "local rootful Docker Unix socket")
-	mode := flag.String("mode", "primary", "primary or alternative")
+	mode := flag.String("mode", "auto", "auto (alternative names with vnStat collision fallback), primary or alternative")
+	vnstat := flag.String("vnstat", "auto", "auto-detect vnStat, off, or path to a vnStat 2.x executable")
 	interval := flag.Duration("interval", 30*time.Second, "full reconciliation interval (at least 1s)")
 	mappingFile := flag.String("mapping-file", "", "atomic JSON snapshot path; parent directory must exist")
 	once := flag.Bool("once", false, "reconcile once, print JSON, then exit (nonzero on errors)")
@@ -85,8 +87,8 @@ func run(log *slog.Logger) error {
 	if flag.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments")
 	}
-	if *mode != "primary" && *mode != "alternative" {
-		return fmt.Errorf("mode must be primary or alternative")
+	if *mode != "auto" && *mode != "primary" && *mode != "alternative" {
+		return fmt.Errorf("mode must be auto, primary or alternative")
 	}
 	if *interval < time.Second {
 		return fmt.Errorf("interval must be at least 1s")
@@ -106,6 +108,22 @@ func run(log *slog.Logger) error {
 	defer cancel()
 	docker := newDocker(*socket)
 	r := reconciler{docker: docker, links: commandLinks{ip: ip, nsenter: nsenter}, mode: *mode, dryRun: *dryRun}
+	if *vnstat != "off" {
+		program := *vnstat
+		if program == "auto" {
+			program = "vnstat"
+		}
+		path, err := exec.LookPath(program)
+		if err != nil && *vnstat != "auto" {
+			return fmt.Errorf("vnStat executable is required: %w", err)
+		}
+		if err == nil {
+			r.vnstat = &vnstatClient{path: path, exec: command}
+			log.Info("vnStat reconciliation enabled", "executable", path)
+		} else {
+			log.Info("vnStat not installed; monitoring reconciliation disabled")
+		}
+	}
 	var skipped map[mapping]struct{}
 	reconcile := func() error {
 		result, scanErr := r.run(ctx)

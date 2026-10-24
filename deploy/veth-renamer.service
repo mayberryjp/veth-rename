@@ -1,15 +1,15 @@
 [Unit]
 Description=Label-driven Docker veth and container macvlan naming
 Documentation=https://docs.docker.com/engine/network/drivers/bridge/
-Wants=docker.service
-After=docker.service
+Wants=docker.service vnstat.service
+After=docker.service vnstat.service
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/sbin/veth-renamer --mode=primary --mapping-file=/run/veth-renamer/mappings.json
+ExecStart=/usr/sbin/veth-renamer --mode=auto --mapping-file=/run/veth-renamer/mappings.json
 Restart=on-failure
 RestartSec=5
 RuntimeDirectory=veth-renamer
@@ -17,10 +17,11 @@ RuntimeDirectoryMode=0755
 UMask=0022
 NoNewPrivileges=true
 ProtectSystem=strict
+ReadWritePaths=-/var/lib/vnstat
 ProtectHome=true
 PrivateTmp=true
 # Do not enable PrivateNetwork or restrict namespace entry: nsenter needs host/netns access.
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SYS_PTRACE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_OVERRIDE
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 
 [Install]

@@ -38,7 +38,7 @@ func command(ctx context.Context, program string, args ...string) ([]byte, error
 	defer cancel()
 	out, err := exec.CommandContext(ctx, program, args...).CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w: %s", program, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return out, fmt.Errorf("%s %s: %w: %s", program, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return out, nil
 }

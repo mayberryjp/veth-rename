@@ -2,9 +2,46 @@
 
 A small, dependency-free Go daemon for **rootful Docker Engine on an Ubuntu
 host**. It reads container labels, finds the matching host-side bridge veth,
-and applies a primary or alternative interface name. It also names macvlan
+and applies an alternative interface name by default. It also names macvlan
 interfaces inside container network namespaces. Unlabeled containers are
-never renamed.
+never renamed. When vnStat 2.x is installed, it also registers verified live
+host interfaces and maintains readable vnStat aliases automatically.
+
+## Automatic monitoring repair
+
+The default `--mode=auto` never attempts a primary rename. It adds an
+alternative name when available and synchronizes vnStat using the actual
+kernel primary name, not the alternative name. On every scan it detects
+missing registrations or incorrect aliases and repairs them, including after
+container recreation. Reads are batched and writes are verified afterward.
+
+If an old interface occupies a requested name (for example a disconnected
+`veth_symbols` while the container uses `dh-90941d7c6428`), auto mode records
+a `naming_warning` and monitors the verified live `dh-*` interface with the
+vnStat alias `veth_symbols`. It does not delete, rename, or take down the
+conflicting link. Alternative-name failures also fall back to monitoring.
+Duplicate label claims and endpoint validation failures still fail closed.
+Without vnStat installed, name conflicts remain errors rather than being
+reported as repaired.
+
+Deploy the new binary **and** updated systemd unit, then reload systemd and
+restart `veth-renamer.service`. The packaged unit uses auto mode and starts
+after vnStat. Remove any local `--mode=primary` override to opt into auto
+repair. Explicit primary/alternative modes retain strict naming behavior.
+vnStat must already be installed; vnstatd initializes and collects into its
+database. Startup/database failures remain visible and are retried.
+Use `--vnstat=off` to disable integration or `--vnstat=/path/to/vnstat` to
+require a particular executable. Container-namespace macvlan interfaces are
+not registered in the host's vnStat database.
+
+Traffic history is never removed, renamed, or merged. Old rows remain for
+historical reporting; aliases do not combine history across recreated
+interfaces or change the kernel name used with `vnstat -i`. This repairs
+ongoing monitoring without interrupting container networking, rather than
+attempting unsafe live renames or guessing which old links can be deleted.
+The unit permits writes to `/var/lib/vnstat` and includes `CAP_DAC_OVERRIDE`
+to update a database owned by the vnstat account. Sites using a custom
+database directory must add that directory to the unit's `ReadWritePaths`.
 
 ## Important correction to the original proposal
 
@@ -12,7 +49,7 @@ never renamed.
 interface renames while a device is UP (`Device or resource busy`). This service
 never brings interfaces down, retries with downtime, or changes firewall rules.
 Consequently, **primary mode will commonly report errors instead of renaming
-running Docker interfaces**. Primary mode is the requested default, not a
+running Docker interfaces**. Primary mode is an explicit opt-in, not a
 guarantee of live renaming.
 
 For readable names without disrupting running containers, use
@@ -295,7 +332,8 @@ if a primary rename succeeds.
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--socket` | `/var/run/docker.sock` | Local Docker Unix socket |
-| `--mode` | `primary` | `primary` or `alternative` |
+| `--mode` | `auto` | Safe alternative naming with vnStat fallback; `primary`/`alternative` retain strict naming |
+| `--vnstat` | `auto` | Detect vnStat 2.x if installed; `off` disables, or provide an executable path |
 | `--interval` | `30s` | Full scan interval, at least `1s` |
 | `--mapping-file` | disabled | Atomic JSON snapshot; parent directory must exist |
 | `--once` | false | One scan, JSON to stdout, nonzero on errors |
@@ -312,10 +350,13 @@ The systemd unit writes `/run/veth-renamer/mappings.json`. Each snapshot has
   Interface names and indices belong to that namespace; macvlan rows have an
   empty `bridge`. The namespace may be absent when discovery fails or a driver
   is unsupported.
-- `status`: `applied`, `unchanged`, `would-change`, `skipped`, or `error`.
+- `status`: `applied`, `unchanged`, `monitored`, `would-change`, `skipped`, or `error`.
+- `naming_warning`: auto mode is monitoring a live link instead of applying a name.
+- `vnstat_status`: `applied`, `unchanged`, `would-change`, or `error`, when enabled.
+- `vnstat_error`: registration, alias, database, or readback failures.
 - An `error` explanation when applicable.
 
-In alternative mode, `interface` is still Docker's primary name;
+In auto/alternative mode, `interface` is still Docker's primary name;
 `requested_name` is the alternative name. Errors before peer discovery have
 an empty interface and index zero. An unavailable container inspection creates
 an error row with its ID. A complete scan removes rows for stopped/deleted
@@ -336,7 +377,7 @@ Before enabling the service on important workloads:
 1. Use a disposable labeled container on a test bridge. Preview with `--once
    --dry-run`; compare the mapping's MAC/peer/bridge against
    `docker inspect` and `ip -j -d link`.
-2. Maintain a connection or ping to the container while running `--once`.
+2. Maintain a connection or ping to the container while running `--once --mode=primary`.
    On kernels that reject UP renames, expect a nonzero exit, an `error`
    mapping, the original name, and no deliberate link downtime.
 3. Run `--once --mode=alternative`. Check `ip -d link show` for the alternative
@@ -352,6 +393,10 @@ Before enabling the service on important workloads:
    Restart Docker only on a test host and confirm the event stream reconnects.
 
 No live-host networking or Docker tests are automatically run by `go test`.
+On Linux with vnStat 2.x installed, run the isolated real-CLI check with
+`VNSTAT_INTEGRATION=1 go test -run TestVNStatCLIIntegration -v`.
+It uses only temporary configuration/database files, does not change links,
+and does not access the production vnStat database.
 
 ## Publishing releases
 
