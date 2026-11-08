@@ -459,6 +459,8 @@ enable, or restart the service, including during upgrades.
 [The GitHub Actions workflow](.github/workflows/release.yml) runs Go tests/vet,
 shell syntax checks and ShellCheck, mocked installer tests, a snapshot package
 build, and Debian package structure checks before permitting a tagged release.
+Both workflow jobs install the pinned GoReleaser tool through GitHub's API and
+verify its SHA-256 checksum, avoiding the normal release-download route.
 
 To publish:
 

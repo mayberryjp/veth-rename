@@ -27,21 +27,17 @@ jobs:
           sudo env PRIMARY_REPAIR_INTEGRATION=1 "$RUNNER_TEMP/veth-renamer.test" -test.run '^TestPrimaryRepairKernelIntegration$' -test.v
       - name: Validate shell scripts
         run: |
-          for script in install.sh tests/*.sh; do bash -n "$script"; done
+          for script in install.sh tests/*.sh .github/scripts/*.sh; do bash -n "$script"; done
           for script in packaging/*.sh; do sh -n "$script"; done
-          shellcheck install.sh tests/*.sh packaging/*.sh
+          shellcheck install.sh tests/*.sh packaging/*.sh .github/scripts/*.sh
       - run: bash tests/installer_test.sh
-      - uses: goreleaser/goreleaser-action@v6
-        with:
-          distribution: goreleaser
-          version: v2.18.3
-          args: check
+      - name: Install verified GoReleaser through the GitHub API
+        run: bash .github/scripts/setup-goreleaser.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: goreleaser check
       - name: Build snapshot packages
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          distribution: goreleaser
-          version: v2.18.3
-          args: release --snapshot --clean
+        run: goreleaser release --snapshot --clean
       - name: Check Debian packages
         run: bash tests/package_test.sh
 
@@ -59,10 +55,10 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - uses: goreleaser/goreleaser-action@v6
-        with:
-          distribution: goreleaser
-          version: v2.18.3
-          args: release --clean
+      - name: Install verified GoReleaser through the GitHub API
+        run: bash .github/scripts/setup-goreleaser.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: goreleaser release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
