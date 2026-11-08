@@ -87,14 +87,52 @@ fi
 asset="veth-renamer_${version#v}_${arch}.deb"
 base="https://github.com/$repo/releases/download/$version"
 tmp=$(mktemp -d)
-cleanup() { rm -f -- "$tmp/$asset" "$tmp/checksums.txt"; rmdir -- "$tmp"; }
+cleanup() { rm -f -- "$tmp/$asset" "$tmp/checksums.txt" "$tmp/release.json"; rmdir -- "$tmp"; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+download_asset() {
+    local name=$1 api_url
+    if download --output "$tmp/$name" "$base/$name"; then
+        return 0
+    fi
+    printf 'Direct download failed for %s; retrying through the GitHub API.\n' "$name" >&2
+    command -v python3 >/dev/null ||
+        die "GitHub API download fallback requires python3; install it and retry"
+    if [[ ! -f "$tmp/release.json" ]]; then
+        download --header 'Accept: application/vnd.github+json' \
+            --output "$tmp/release.json" \
+            "https://api.github.com/repos/$repo/releases/tags/$version" ||
+            die "Could not retrieve release metadata for $version"
+    fi
+    api_url=$(python3 - "$tmp/release.json" "$name" "$repo" "$version" <<'PY'
+import json
+import sys
+
+path, name, repo, version = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    release = json.load(stream)
+if release.get("tag_name") != version or release.get("draft") is not False:
+    sys.exit("Release metadata does not match the requested published version")
+assets = [asset for asset in release["assets"] if asset["name"] == name]
+if len(assets) != 1:
+    sys.exit(f"Expected exactly one release asset named {name}")
+asset = assets[0]
+asset_id = asset["id"]
+expected = f"https://api.github.com/repos/{repo}/releases/assets/{asset_id}"
+if type(asset_id) is not int or asset_id <= 0 or asset["url"] != expected:
+    sys.exit("Release asset has an invalid GitHub API URL")
+print(expected)
+PY
+    ) || die "Could not resolve the release asset $name"
+    download --header 'Accept: application/octet-stream' \
+        --output "$tmp/$name" "$api_url"
+}
+
 printf 'Downloading %s from %s (%s)...\n' "$asset" "$repo" "$version"
-download --output "$tmp/$asset" "$base/$asset" || die "Package download failed"
-download --output "$tmp/checksums.txt" "$base/checksums.txt" || die "Checksum download failed"
+download_asset "$asset" || die "Package download failed"
+download_asset checksums.txt || die "Checksum download failed"
 
 digest=
 matches=0

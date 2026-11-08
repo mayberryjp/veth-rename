@@ -208,6 +208,13 @@ Requires `curl`, `sudo` (unless already root), and standard Ubuntu package tools
 If needed, run `sudo apt-get update` before installing so dependency indexes are
 current. No Go toolchain is needed on the target host.
 
+If a release download fails (for example, with a GitHub gateway timeout), the
+installer retries that same release asset through GitHub's API. This fallback
+requires `python3` to validate release metadata; install it with
+`sudo apt-get install python3` if needed. SHA-256 verification and package
+identity checks remain mandatory, and installation stops if either download
+route or verification fails.
+
 **Installation does not start, enable, or restart the daemon by default.**
 To explicitly enable and start it:
 

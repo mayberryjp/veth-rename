@@ -11,7 +11,8 @@ cleanup() {
     # Failed installers must clean their downloads too.
     if [[ -d "$tmp/download" ]]; then
         rm -f -- "$tmp/download/veth-renamer_1.2.3_amd64.deb" \
-            "$tmp/download/veth-renamer_1.2.3_arm64.deb" "$tmp/download/checksums.txt"
+            "$tmp/download/veth-renamer_1.2.3_arm64.deb" "$tmp/download/checksums.txt" \
+            "$tmp/download/release.json"
         rmdir -- "$tmp/download"
     fi
     rmdir -- "$tmp/bin" "$tmp"
@@ -51,17 +52,52 @@ case "$tool" in
         printf '%s\n' "$TEST_ROOT/download"
         ;;
     curl)
-        out= url=
+        out= url= header=
         while (($#)); do
             case "$1" in
                 --output) out=$2; shift 2 ;;
+                --header) header=$2; shift 2 ;;
                 --write-out|--retry|--proto|--proto-redir|--connect-timeout|--max-time) shift 2 ;;
                 --head|--fail|--silent|--show-error|--location|--tlsv1.2) shift ;;
                 https://*) url=$1; shift ;;
                 *) exit 98 ;;
             esac
         done
-        printf 'curl %s\n' "$url" >> "$TEST_ROOT/log"
+        printf 'curl %s %s\n' "$url" "$header" >> "$TEST_ROOT/log"
+        case "$url" in
+            https://api.github.com/*/releases/tags/*)
+                [[ "$header" == 'Accept: application/vnd.github+json' ]] || exit 95
+                [[ "$TEST_SCENARIO" != no-metadata ]] || exit 22
+                if [[ "$TEST_SCENARIO" == malformed-metadata ]]; then
+                    printf 'invalid JSON\n' > "$out"
+                    exit 0
+                fi
+                api=${url%/tags/*}
+                tag=v1.2.3
+                [[ "$TEST_SCENARIO" != wrong-tag ]] || tag=v9.9.9
+                package="veth-renamer_1.2.3_${TEST_ARCH}.deb"
+                [[ "$TEST_SCENARIO" != missing-asset ]] || package=another.deb
+                asset_url="$api/assets/1"
+                [[ "$TEST_SCENARIO" != unsafe-api-url ]] || asset_url=https://example.invalid/package
+                printf '{"tag_name":"%s","draft":false,"assets":[{"id":1,"name":"%s","url":"%s"},{"id":2,"name":"checksums.txt","url":"%s/assets/2"}]}\n' \
+                    "$tag" "$package" "$asset_url" "$api" > "$out"
+                exit 0
+                ;;
+            https://api.github.com/*/releases/assets/1)
+                [[ "$header" == 'Accept: application/octet-stream' ]] || exit 95
+                [[ "$TEST_SCENARIO" != no-package ]] || exit 22
+                cp "$TEST_ROOT/package" "$out"
+                exit 0
+                ;;
+            https://api.github.com/*/releases/assets/2)
+                [[ "$header" == 'Accept: application/octet-stream' ]] || exit 95
+                [[ "$TEST_SCENARIO" != no-checksums ]] || exit 22
+                digest=$TEST_SUM
+                [[ "$TEST_SCENARIO" != fallback-bad-checksum ]] || digest=$(printf '%064d' 0)
+                printf '%s  veth-renamer_1.2.3_%s.deb\n' "$digest" "$TEST_ARCH" > "$out"
+                exit 0
+                ;;
+        esac
         case "$url" in
             */releases/latest)
                 if [[ "$TEST_SCENARIO" == bad-redirect ]]; then
@@ -73,7 +109,9 @@ case "$tool" in
                 fi
                 ;;
             */checksums.txt)
-                [[ "$TEST_SCENARIO" != no-checksums ]] || exit 22
+                case "$TEST_SCENARIO" in
+                    no-checksums|checksum-fallback|both-fallback|fallback-bad-checksum) exit 22 ;;
+                esac
                 asset="veth-renamer_1.2.3_${TEST_ARCH}.deb"
                 digest=$TEST_SUM
                 case "$TEST_SCENARIO" in
@@ -87,7 +125,9 @@ case "$tool" in
                 fi
                 ;;
             *.deb)
-                [[ "$TEST_SCENARIO" != no-package ]] || exit 22
+                case "$TEST_SCENARIO" in
+                    no-package|package-fallback|both-fallback|fallback-bad-checksum|no-metadata|malformed-metadata|wrong-tag|missing-asset|unsafe-api-url) exit 22 ;;
+                esac
                 cp "$TEST_ROOT/package" "$out"
                 ;;
             *) exit 97 ;;
@@ -149,8 +189,20 @@ TEST_UID=1000 run_ok --version v1.2.3 --start
 assert_log 'sudo env DEBIAN_FRONTEND=noninteractive apt-get'
 assert_log 'sudo systemctl restart'
 
+for scenario in package-fallback checksum-fallback both-fallback; do
+    TEST_SCENARIO=$scenario run_ok --version v1.2.3 --start
+    assert_log '/releases/tags/v1.2.3'
+    assert_log 'apt-get install --yes'
+    assert_log 'systemctl restart'
+    [[ $(grep -c '/releases/tags/' "$tmp/log") == 1 ]] || fail "Metadata was downloaded more than once"
+done
+TEST_SCENARIO=both-fallback TEST_ARCH=arm64 run_ok --version v1.2.3 --repo another/project
+assert_log 'https://api.github.com/repos/another/project/releases/assets/1'
+assert_log 'https://api.github.com/repos/another/project/releases/assets/2'
+
 for scenario in bad-checksum missing-checksum duplicate-checksum malformed-checksum \
-    no-package no-checksums wrong-package wrong-arch bad-redirect no-release; do
+    no-package no-checksums wrong-package wrong-arch bad-redirect no-release \
+    fallback-bad-checksum no-metadata malformed-metadata wrong-tag missing-asset unsafe-api-url; do
     TEST_SCENARIO=$scenario run_bad
     assert_no_log apt-get
     assert_no_log systemctl
