@@ -15,6 +15,8 @@ import (
 	"runtime"
 	"syscall"
 	"time"
+
+	"veth-rename/internal/flow"
 )
 
 func writeSnapshot(path string, result snapshot) error {
@@ -76,7 +78,20 @@ func logScanError(log *slog.Logger, err, previous error) error {
 	return err
 }
 
-func run(log *slog.Logger) error {
+func monitoredInterfaces(mappings []mapping) []flow.Interface {
+	var interfaces []flow.Interface
+	for _, m := range mappings {
+		if m.Namespace != "host" || m.IfIndex <= 0 ||
+			(m.Status != "applied" && m.Status != "unchanged" && m.Status != "monitored") {
+			continue
+		}
+		interfaces = append(interfaces, flow.Interface{Index: m.IfIndex, Name: m.Interface,
+			Identity: m.ContainerID + "/" + m.NetworkID})
+	}
+	return interfaces
+}
+
+func run(log *slog.Logger) (runErr error) {
 	socket := flag.String("socket", "/var/run/docker.sock", "local rootful Docker Unix socket")
 	mode := flag.String("mode", "primary-repair", "primary-repair (brief host-veth interruption), auto, primary or alternative")
 	vnstat := flag.String("vnstat", "auto", "auto-detect vnStat, off, or path to a vnStat 2.x executable")
@@ -84,6 +99,7 @@ func run(log *slog.Logger) error {
 	mappingFile := flag.String("mapping-file", "", "atomic JSON snapshot path; parent directory must exist")
 	once := flag.Bool("once", false, "reconcile once, print JSON, then exit (nonzero on errors)")
 	dryRun := flag.Bool("dry-run", false, "inspect and plan without modifying interfaces")
+	ipfixConfig := flag.String("ipfix-config", "", "opt-in eBPF/IPFIX YAML configuration file (daemon mode only)")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments")
@@ -93,6 +109,17 @@ func run(log *slog.Logger) error {
 	}
 	if *interval < time.Second {
 		return fmt.Errorf("interval must be at least 1s")
+	}
+	var monitoringConfig flow.Config
+	if *ipfixConfig != "" {
+		if *once || *dryRun {
+			return fmt.Errorf("ipfix-config cannot be used with once or dry-run")
+		}
+		var err error
+		monitoringConfig, err = flow.LoadConfig(*ipfixConfig)
+		if err != nil {
+			return err
+		}
 	}
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("this daemon must run directly on a Linux Docker host")
@@ -114,6 +141,22 @@ func run(log *slog.Logger) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	var monitoring *flow.Service
+	var flowTicks <-chan time.Time
+	if *ipfixConfig != "" {
+		var err error
+		monitoring, err = flow.New(ctx, monitoringConfig)
+		if err != nil {
+			return err
+		}
+		defer func() { runErr = errors.Join(runErr, monitoring.Close()) }()
+		ticker := time.NewTicker(monitoring.PollInterval())
+		defer ticker.Stop()
+		flowTicks = ticker.C
+		log.Info("eBPF IPFIX monitoring enabled", "collector", monitoringConfig.Collector,
+			"observation_domain_id", monitoringConfig.ObservationDomainID,
+			"sampling_rate", monitoringConfig.SamplingRate, "capture_filter", monitoringConfig.CaptureFilter)
+	}
 	if *mode == "primary-repair" && !*dryRun {
 		log.Warn("controlled primary repair enabled; verified managed host veths may be briefly taken DOWN and restored UP")
 	}
@@ -144,8 +187,11 @@ func run(log *slog.Logger) error {
 		}
 		skipped = logEndpoints(log, result.Mappings, skipped)
 		var outputErr error
+		if monitoring != nil {
+			outputErr = monitoring.Sync(monitoredInterfaces(result.Mappings))
+		}
 		if *mappingFile != "" {
-			outputErr = writeSnapshot(*mappingFile, result)
+			outputErr = errors.Join(outputErr, writeSnapshot(*mappingFile, result))
 		}
 		if *once {
 			outputErr = errors.Join(outputErr, json.NewEncoder(os.Stdout).Encode(result))
@@ -164,10 +210,18 @@ func run(log *slog.Logger) error {
 	scan()
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
+	var previousFlowError error
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-flowTicks:
+			err := monitoring.Poll()
+			if err != nil && (previousFlowError == nil || err.Error() != previousFlowError.Error()) {
+				log.Error("IPFIX monitoring failed; daemon will retry", "error", err)
+			}
+			previousFlowError = err
+			continue
 		case <-ticker.C:
 		case <-changes:
 			// Coalesce bursts from starts and network attachments.

@@ -1,0 +1,9 @@
+collector: "192.0.2.10:4739"
+observation_domain_id: 1
+active_timeout: 60s
+idle_timeout: 15s
+poll_interval: 1s
+template_refresh: 30s
+max_flows_per_veth: 65536
+sampling_rate: 1
+capture_filter: ""

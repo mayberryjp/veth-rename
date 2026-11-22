@@ -18,6 +18,11 @@ for package in "${packages[@]}"; do
     files=$(dpkg-deb --fsys-tarfile "$package" | tar -tf -)
     grep -qx './usr/sbin/veth-renamer' <<< "$files"
     grep -qx './usr/lib/systemd/system/veth-renamer.service' <<< "$files"
+    for example in ipfix.example.yaml ipfix.conf; do
+        grep -qx "./usr/share/doc/veth-renamer/$example" <<< "$files"
+        diff -u "deploy/$example" \
+            <(dpkg-deb --fsys-tarfile "$package" | tar -xOf - "./usr/share/doc/veth-renamer/$example")
+    done
     details=$(dpkg-deb --fsys-tarfile "$package" | tar -tvf -)
     grep -Eq '^-rwxr-xr-x .* ./usr/sbin/veth-renamer$' <<< "$details"
     grep -Eq '^-rw-r--r-- .* ./usr/lib/systemd/system/veth-renamer.service$' <<< "$details"

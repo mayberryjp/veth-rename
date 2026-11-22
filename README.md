@@ -1,11 +1,190 @@
 # veth-renamer
 
-A small, dependency-free Go daemon for **rootful Docker Engine on an Ubuntu
+A small Go daemon for **rootful Docker Engine on an Ubuntu
 host**. It reads container labels, finds the matching host-side bridge veth,
 and repairs its actual primary interface name by default. It also names macvlan
 interfaces inside container network namespaces. Unlabeled containers are
 never renamed. When vnStat 2.x is installed, it also registers verified live
 host interfaces and maintains readable vnStat aliases automatically.
+
+## Optional eBPF / IPFIX traffic monitoring
+
+Renaming and vnStat behavior are unchanged. Enable the independent exporter
+with `--ipfix-config=/etc/veth-renamer/ipfix.yaml`. It monitors only verified
+host-side veths belonging to containers managed by the existing rename labels,
+including DHCP bridge veths. Unlabeled containers, macvlan, shared bridges,
+physical NICs and container-side interfaces are excluded. Failed or ambiguous
+endpoint validation is not a license to attach a traffic monitor.
+
+Requires Linux **6.6+** with TCX/eBPF support (Ubuntu 24.04's 6.8 kernel on
+amd64 is supported), and `CAP_BPF`, `CAP_PERFMON` and `CAP_NET_ADMIN`
+(the daemon already requires additional capabilities for renaming).
+Monitoring uses read-only packet observation at both host-veth TCX ingress
+and egress. It does not replace existing classifiers, change qdiscs, modify
+packets, or lower links. Hooks follow ifindexes across primary renames and
+are closed on endpoint removal or shutdown. Packets before initial attachment
+are not captured; Docker events and periodic reconciliation discover new veths.
+
+Copy and edit the supplied example, then install the opt-in systemd drop-in:
+
+```bash
+sudo install -d -m 0755 /etc/veth-renamer /etc/systemd/system/veth-renamer.service.d
+sudo install -m 0644 /usr/share/doc/veth-renamer/ipfix.example.yaml /etc/veth-renamer/ipfix.yaml
+# Set collector and timers in /etc/veth-renamer/ipfix.yaml before starting.
+sudo install -m 0644 /usr/share/doc/veth-renamer/ipfix.conf /etc/systemd/system/veth-renamer.service.d/ipfix.conf
+sudo systemctl daemon-reload
+sudo systemctl restart veth-renamer
+```
+
+For source installs, use `deploy/ipfix.example.yaml` and `deploy/ipfix.conf`
+instead. Preserve any custom naming flags when editing the drop-in's
+`ExecStart`. The base unit remains unchanged and needs no extra capabilities
+or network address families when monitoring is disabled.
+
+Example configuration (YAML only, unknown/duplicate keys and invalid types
+are rejected; restart to reload):
+
+```yaml
+collector: "192.0.2.10:4739"
+observation_domain_id: 1
+active_timeout: 60s
+idle_timeout: 15s
+poll_interval: 1s
+template_refresh: 30s
+max_flows_per_veth: 65536
+sampling_rate: 1
+capture_filter: ""
+```
+
+`collector` is required, accepts DNS/IPv4 `host:port` or `[IPv6]:port`, and uses
+UDP. Choose a distinct observation domain per exporter host. Other settings
+have the defaults above (domain defaults to zero). Durations must be at least
+1ms; polling must not exceed either timeout; template refresh is at most 10m.
+`sampling_rate` is 1..1000000; 1 observes every packet, 4 examines every fourth
+packet. A shared atomic sequence per veth spans ingress and egress, before
+parsing or exclusions (including non-IP frames). Counters describe samples,
+not scaled totals; the collector can scale using the exported interval.
+Collector DNS is resolved at startup. Configuration failures, verifier
+failures, attach failures, metering losses and socket errors are explicit
+errors in journald; attachment and export errors are retried without changing
+rename results. `--once` and `--dry-run` cannot enable monitoring.
+
+**Migration is required for existing JSON configurations.** Convert settings
+to YAML, save as `.yaml` or `.yml`, and update the service drop-in's
+`--ipfix-config` path before restarting. JSON content is rejected even if
+renamed to `.yaml`. Duration fields are strings, numeric fields are integers,
+and defaults apply only to omitted settings, not invalid/null values.
+
+`capture_filter` accepts exactly `""` (all IP), `ip` (IPv4), `ip6` (IPv6),
+`tcp`, `udp`, `icmp` (IPv4 ICMP), or `icmp6`. Sampling happens before parsing
+and filtering. UDP packets destined to the actual resolved collector address
+and port are excluded to avoid export feedback; replies and other destination
+ports remain eligible. Reconnection uses that same resolved address, so the
+kernel exclusion cannot diverge from the export destination.
+
+### Flow and wire semantics
+
+- IPv4/IPv6 **unidirectional** flows, keyed per veth by IP version,
+  protocol, addresses, TCP/UDP/SCTP ports and TOS/IPv6 traffic class.
+  ICMP/ICMPv6 use zero source port and destination port `(type << 8) | code`.
+  Other IP protocols still use zero ports; only fragments are excluded by the
+  no-fragment-flow policy. Zero is a valid ICMP encoding (IPv4 echo reply).
+  Capture remains on both ingress and egress. Source/destination addresses and
+  ports preserve the observed packet direction: A->B and B->A have separate
+  counters and expiration timers. The collector correlates opposite flows.
+- Each record carries one packet/octet delta counter pair,
+  start/end timestamps in Unix milliseconds, `observationPointId`
+  (host ifindex), `interfaceName`, and `flowEndReason`: idle (1), active (2),
+  or forced end (4) on removal/shutdown. No reverse IEs or `biflowDirection`
+  are exported.
+  No payload or packet samples are exported.
+- Records include `ipClassOfService` (IE 5), ORed eight-bit `tcpControlBits`
+  (IE 6), `samplingInterval` (IE 34), and `samplingAlgorithm` (IE 35 = 1,
+  deterministic). TCP flags describe only packets in that exported segment;
+  acknowledged flags do not leak into later active/idle segments.
+- Active and idle exports remove completed segments from the flow table.
+  Continued traffic starts a new segment with exact sampled-packet start/end
+  timestamps. Packet timestamps use the monotonic clock translated against
+  the startup wall clock. Generic active/idle timers are unchanged; there
+  are no protocol-specific timers.
+- UDP IPFIX version 10 messages use network byte order, distinct IPv4/IPv6
+  template IDs (256/257), zero Set padding, and sequence numbers counting
+  **Data Records**, not templates or datagrams. **Every message** begins with
+  both IPv4 and IPv6 templates, followed by any data. Template-only refresh
+  also continues while idle; `template_refresh` controls that idle interval,
+  not whether templates accompany data. The collector's UDP template lifetime
+  should be at least three times `template_refresh`. No Template Withdrawals
+  are sent over UDP. Messages are at most 464 bytes, so IPv6 plus UDP headers
+  fit the RFC 7011 conservative 512-byte packet recommendation.
+- Due records are batched within that size limit rather than sent one per
+  datagram. Each successful datagram acknowledges only its own records;
+  partial batch failures retain the remaining records without replaying
+  already accepted data.
+- The selected UDP transport follows RFC 7011's UDP wire requirements.
+  This is **not** a claim of full RFC 7011 transport
+  implementation compliance: section 10.1 also mandates SCTP support, which
+  this UDP-only feature does not implement.
+- UDP is not reliable or encrypted. A successful send is not a collector
+  acknowledgment; use a trusted, provisioned management network and tolerate
+  loss/reordering. Sequence gaps let collectors detect lost datagrams.
+  Socket failures retain unsent deltas for retry; process death loses
+  unexported in-memory state.
+- Export failures close the failed socket and retry with exponential backoff
+  from 1 second up to 30 seconds. Metering and bounded buffering continue
+  during an outage. Socket recreation preserves flow/pending state and the
+  observation domain; a new UDP session starts with a fresh sequence number.
+  Shutdown detaches capture first and uses a two-second overall flush budget,
+  not a timeout per flow. Unexported leftovers are explicit errors. Only error
+  logs are provided; no status API, status file, or periodic summaries exist.
+
+### Metering limits
+
+Every supported IP packet selected by the sampler is observed. With the
+default `sampling_rate=1`, no sampling is performed.
+Counters describe Linux **skbs** and IP-layer octets, excluding
+Ethernet/VLAN headers. GRO/GSO/TSO can coalesce skbs, so these are not guaranteed
+wire-packet counts with offloads enabled. For wire-packet accounting, disable
+coalescing/segmentation offloads on both ends separately; the daemon deliberately
+does not alter offload settings or the rename operation.
+
+IPv6 extension chains (up to eight headers) and up to two VLAN headers are
+parsed. IPv4 fragments (including first fragments) and all IPv6 Fragment
+headers (including atomic fragments) are excluded rather than guessed into
+portless flows. Sampled exclusions are counted separately in the kernel;
+they are intentional exclusions, not capacity/malformed errors. IPv6 jumbo
+payloads, longer extension chains and malformed IP headers increment explicit
+unsupported/malformed counters. Non-IP traffic is outside this feature's scope.
+
+`max_flows_per_veth` (1..1048576) now bounds **concurrently retained directional
+flows**, not lifetime keys. Idle/active expiration reclaims entries; when full,
+the least recently updated flow is queued for early export with
+`flowEndReason=5` (lack of resources). The collector aggregates multiple
+segments of a connection.
+
+To avoid races between kernel updates and flow deletion, eBPF transfers
+sampled packet-header metadata through a bounded **4 MiB ring buffer per veth**.
+The daemon owns the flow table and its expiration/LRU indexes; no concurrently
+updated kernel flow entry is deleted or reset. This introduces per-sample
+userspace processing and is not a guarantee of wire-rate performance.
+The ring holds roughly 65,536 metadata events and absorbs bursts, not
+sustained overload. Polling and Docker reconciliation delays can fill it;
+ring-buffer losses are counted and reported explicitly.
+
+Each veth also has a bounded pending-record queue of
+`max(4096, max_flows_per_veth)` records. During prolonged collector failure,
+completed records are retained until this queue fills. Existing active
+flows can still accumulate counts, but a new key requiring eviction is then
+rejected and logged with an exact packet-loss count rather than discarding
+already pending records. Memory and throughput are finite; there is no claim
+of unlimited-capacity or lossless monitoring.
+
+When upgrading from an earlier template schema, restart the exporter
+and ensure the collector accepts the refreshed templates. Template IDs stay
+256/257, but fields have changed. The first 13 fields follow the provided
+unidirectional IPFIX schema; three additional standard IEs retain per-veth
+identity and end reason. Records are 77 bytes (IPv4) or 101 bytes (IPv6),
+not the reference schema's 52/76 bytes. Collectors must decode templates,
+not hard-code record widths.
 
 ## Controlled primary-name repair
 
@@ -268,7 +447,9 @@ retry the installer. It refuses to silently override a local unit. An old
 
 ## Build and preview
 
-Requires Go 1.23+ to build; no Go modules need downloading.
+Requires Go 1.23+ to build; Go downloads cilium/ebpf, x/sys and yaml.v3.
+The precompiled little-endian eBPF object is embedded, so ordinary builds and
+cross-builds require neither clang nor runtime compilation.
 Run these commands on the Ubuntu host:
 
 ```bash
@@ -287,6 +468,19 @@ sudo ./bin/veth-renamer --once
 
 # Non-disruptive alternative naming.
 sudo ./bin/veth-renamer --once --mode=alternative
+```
+
+After changing the packet parser, regenerate the checked-in object on Linux
+amd64 using clang 14 and libbpf headers:
+
+```bash
+sudo apt-get install -y clang-14 libbpf-dev
+go generate ./internal/flow
+go test ./...
+# Kernel tests create veths only inside this isolated network namespace.
+go test -c -o /tmp/veth-flow.test ./internal/flow
+sudo unshare --net env FLOW_INTEGRATION=1 /tmp/veth-flow.test -test.run '^TestKernel' -test.v
+rm /tmp/veth-flow.test
 ```
 
 For cross-compilation, set `GOOS=linux GOARCH=amd64` (or `arm64`) when

@@ -18,6 +18,7 @@ func TestLogScanErrorDeduplicatesFailures(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		previous = logScanError(log, errors.New(message), previous)
 	}
+
 	assertScanErrorLog(t, &output, message)
 	if previous == nil || previous.Error() != message {
 		t.Fatalf("failure state = %v, want %q", previous, message)
@@ -36,6 +37,22 @@ func TestLogScanErrorDeduplicatesFailures(t *testing.T) {
 	}
 	logScanError(log, errors.New(""), nil)
 	assertScanErrorLog(t, &output, "")
+}
+
+func TestMonitoredInterfacesOnlyVerifiedManagedHostVeths(t *testing.T) {
+	records := []mapping{
+		{Namespace: "host", IfIndex: 7, Interface: "veth_app", ContainerID: "c1", NetworkID: "n1", Status: "applied"},
+		{Namespace: "host", IfIndex: 8, Interface: "veth_other", Status: "monitored"},
+		{Namespace: "host", IfIndex: 9, Status: "unchanged"},
+		{Namespace: "container", IfIndex: 10, Status: "applied"},
+		{Namespace: "host", IfIndex: 11, Status: "error"},
+		{Namespace: "host", IfIndex: 12, Status: "skipped"},
+		{Namespace: "host", IfIndex: 13, Status: "would-change"},
+	}
+	got := monitoredInterfaces(records)
+	if len(got) != 3 || got[0].Index != 7 || got[0].Name != "veth_app" || got[0].Identity != "c1/n1" {
+		t.Fatalf("monitoring selection = %+v", got)
+	}
 }
 
 func assertScanErrorLog(t *testing.T, output *bytes.Buffer, want string) {
