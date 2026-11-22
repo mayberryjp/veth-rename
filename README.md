@@ -655,6 +655,8 @@ shell syntax checks and ShellCheck, mocked installer tests, a snapshot package
 build, and Debian package structure checks before permitting a tagged release.
 Both workflow jobs install the pinned GoReleaser tool through GitHub's API and
 verify its SHA-256 checksum, avoiding the normal release-download route.
+Both jobs use Ubuntu 24.04 to keep the clang-14 toolchain available. The test
+job regenerates the eBPF object before running Go and live-kernel tests.
 
 To publish:
 
