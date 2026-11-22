@@ -87,6 +87,7 @@ func TestKernelConcurrentCapacityExport(t *testing.T) {
 	}
 	seen := make(map[uint16]bool)
 	datagrams, records := 0, 0
+	var decoder recordDecoder
 	if err := collector.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -98,10 +99,10 @@ func TestKernelConcurrentCapacityExport(t *testing.T) {
 		}
 		b = b[:n]
 		datagrams++
-		if len(b) > maxMessage || binary.BigEndian.Uint32(b[8:12]) != uint32(records) {
+		if len(b) > defaultMaxMessageSize || binary.BigEndian.Uint32(b[8:12]) != uint32(records) {
 			t.Fatal("message size or record sequence incorrect")
 		}
-		for _, r := range decodeRecords(t, b) {
+		for _, r := range decoder.decode(t, b) {
 			port := binary.BigEndian.Uint16(r[7])
 			if seen[port] || binary.BigEndian.Uint64(r[2]) != 2 || binary.BigEndian.Uint64(r[1]) != 56 {
 				t.Fatal("concurrent reclamation lost or duplicated traffic")

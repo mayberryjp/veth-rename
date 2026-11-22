@@ -12,11 +12,15 @@ type datagrams struct {
 	packets          [][]byte
 	fail             bool
 	failAt, attempts int
+	writeErr         error
 }
 
 func (d *datagrams) Write(b []byte) (int, error) {
 	d.attempts++
 	if d.fail || d.failAt == d.attempts {
+		if d.writeErr != nil {
+			return 0, d.writeErr
+		}
 		return 0, errors.New("collector unavailable")
 	}
 	d.packets = append(d.packets, append([]byte(nil), b...))
@@ -26,7 +30,7 @@ func (d *datagrams) Write(b []byte) (int, error) {
 func decodeTemplates(t *testing.T, b []byte) map[uint16][]field {
 	t.Helper()
 	if len(b) < 20 || binary.BigEndian.Uint16(b[16:18]) != 2 {
-		t.Fatal("every message must begin with Template Set 2")
+		t.Fatal("template message must begin with Template Set 2")
 	}
 	end := 16 + int(binary.BigEndian.Uint16(b[18:20]))
 	if end > len(b) || end < 20 {
@@ -59,19 +63,36 @@ func decodeTemplates(t *testing.T, b []byte) map[uint16][]field {
 	return result
 }
 
-func decodeRecords(t *testing.T, b []byte) []map[uint16][]byte {
+type recordDecoder struct {
+	templates map[uint16][]field
+}
+
+func (d *recordDecoder) decode(t *testing.T, b []byte) []map[uint16][]byte {
 	t.Helper()
-	ts := decodeTemplates(t, b)
+	if len(b) < 16 || binary.BigEndian.Uint16(b[:2]) != 10 || int(binary.BigEndian.Uint16(b[2:4])) != len(b) {
+		t.Fatal("invalid IPFIX header")
+	}
 	var records []map[uint16][]byte
-	for offset := 16 + int(binary.BigEndian.Uint16(b[18:20])); offset < len(b); {
+	for offset := 16; offset < len(b); {
 		if offset+4 > len(b) {
 			t.Fatal("truncated Set header")
 		}
 		id := binary.BigEndian.Uint16(b[offset : offset+2])
 		end := offset + int(binary.BigEndian.Uint16(b[offset+2:offset+4]))
-		fs, ok := ts[id]
-		if !ok || end > len(b) || end < offset+4 {
-			t.Fatal("invalid Data Set")
+		if end > len(b) || end < offset+4 {
+			t.Fatal("invalid Set length")
+		}
+		if id == 2 {
+			if offset != 16 {
+				t.Fatal("templates must precede data")
+			}
+			d.templates = decodeTemplates(t, b)
+			offset = end
+			continue
+		}
+		fs, ok := d.templates[id]
+		if !ok {
+			t.Fatal("data arrived before its template")
 		}
 		width := 0
 		for _, f := range fs {
@@ -92,6 +113,13 @@ func decodeRecords(t *testing.T, b []byte) []map[uint16][]byte {
 		offset = end
 	}
 	return records
+}
+
+func decodeRecords(t *testing.T, b []byte) []map[uint16][]byte {
+	t.Helper()
+	// Single-message fixtures assume cached templates; stream tests start with an empty decoder.
+	d := recordDecoder{templates: map[uint16][]field{256: fields(4), 257: fields(6)}}
+	return d.decode(t, b)
 }
 
 func singleRecord(t *testing.T, b []byte) map[uint16][]byte {
@@ -120,36 +148,47 @@ func TestIPFIXWire(t *testing.T) {
 	if len(out.packets) != 2 || e.sequence != 2 {
 		t.Fatalf("messages=%d sequence=%d", len(out.packets), e.sequence)
 	}
+	var decoder recordDecoder
 	for i, b := range out.packets {
 		if len(b)+48 > 512 || int(binary.BigEndian.Uint16(b[2:4])) != len(b) ||
 			binary.BigEndian.Uint16(b[:2]) != 10 ||
 			binary.BigEndian.Uint32(b[4:8]) != uint32(now.Unix()) ||
-			binary.BigEndian.Uint32(b[8:12]) != uint32(i) ||
+			binary.BigEndian.Uint32(b[8:12]) != 0 ||
 			binary.BigEndian.Uint32(b[12:16]) != 42 {
 			t.Fatal("invalid IPFIX message header")
 		}
-		ts := decodeTemplates(t, b)
-		for id, fs := range ts {
-			wantIDs := []uint16{8, 12, 7, 11, 4, 5, 6, 2, 1, 152, 153, 34, 35, 138, 82, 136}
-			if id == 257 {
-				wantIDs[0], wantIDs[1] = 27, 28
+		gotRecords := decoder.decode(t, b)
+		if i == 0 {
+			if len(gotRecords) != 0 {
+				t.Fatal("startup must send templates separately")
 			}
-			for j, f := range fs {
-				if f.id != wantIDs[j] {
-					t.Fatalf("wrong field order: %+v", fs)
+			for id, fs := range decoder.templates {
+				wantIDs := []uint16{8, 12, 7, 11, 4, 5, 6, 2, 1, 152, 153, 34, 35, 138, 82, 136}
+				if id == 257 {
+					wantIDs[0], wantIDs[1] = 27, 28
+				}
+				for j, f := range fs {
+					if f.id != wantIDs[j] {
+						t.Fatalf("wrong field order: %+v", fs)
+					}
 				}
 			}
+			continue
 		}
-		got := singleRecord(t, b)
-		for id, want := range map[uint16]uint64{2: 11, 1: 1100, 138: 7, 152: 1700000000001, 153: 1700000000002} {
-			if binary.BigEndian.Uint64(got[id]) != want {
-				t.Fatalf("IE %d: %x", id, got[id])
+		if binary.BigEndian.Uint16(b[16:18]) == 2 || len(gotRecords) != 2 {
+			t.Fatal("data message must use cached templates and batch both families")
+		}
+		for _, got := range gotRecords {
+			for id, want := range map[uint16]uint64{2: 11, 1: 1100, 138: 7, 152: 1700000000001, 153: 1700000000002} {
+				if binary.BigEndian.Uint64(got[id]) != want {
+					t.Fatalf("IE %d: %x", id, got[id])
+				}
 			}
-		}
-		if got[5][0] != 0xb8 || got[6][0] != 0x13 || got[35][0] != 1 ||
-			binary.BigEndian.Uint32(got[34]) != 4 || got[136][0] != 2 ||
-			string(bytes.TrimRight(got[82], "\x00")) != "veth_app" {
-			t.Fatal("packet metadata encoding")
+			if got[5][0] != 0xb8 || got[6][0] != 0x13 || got[35][0] != 1 ||
+				binary.BigEndian.Uint32(got[34]) != 4 || got[136][0] != 2 ||
+				string(bytes.TrimRight(got[82], "\x00")) != "veth_app" {
+				t.Fatal("packet metadata encoding")
+			}
 		}
 	}
 	if err := e.send(nil, now.Add(time.Minute)); err != nil {
@@ -172,7 +211,7 @@ func TestIPFIXFailureAndSequenceWrap(t *testing.T) {
 	if err := e.send([]Record{r}, now); err != nil || e.sequence != 0 {
 		t.Fatalf("wrap: %v", err)
 	}
-	got := singleRecord(t, out.packets[0])
+	got := singleRecord(t, out.packets[1])
 	if binary.BigEndian.Uint64(got[152]) != 0 || binary.BigEndian.Uint64(got[153]) != 0 {
 		t.Fatal("zero timestamps must still occupy eight bytes")
 	}
@@ -192,14 +231,15 @@ func TestIPFIXBatchBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 	total := 0
+	var decoder recordDecoder
 	for _, b := range out.packets {
-		if len(b) > maxMessage {
+		if len(b) > defaultMaxMessageSize {
 			t.Fatalf("oversized message: %d", len(b))
 		}
 		if binary.BigEndian.Uint32(b[8:12]) != uint32(total) {
 			t.Fatal("sequence must count records")
 		}
-		total += len(decodeRecords(t, b))
+		total += len(decoder.decode(t, b))
 	}
 	if e.sequence != 100 || total != 100 {
 		t.Fatal("batching lost or duplicated records")

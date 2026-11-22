@@ -2,13 +2,15 @@ package flow
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"syscall"
 	"time"
 )
 
 // RFC 7011 section 10.3.3: conservative size when path MTU is unknown.
-const maxMessage = 464
+const defaultMaxMessageSize = 464
 
 type field struct {
 	id, length uint16
@@ -102,29 +104,108 @@ type exporter struct {
 	refresh          time.Duration
 	lastTemplate     time.Time
 	samplingRate     uint32
+	maxMessageSize   int
+	messageLimit     int
+	pathMTUBudget    int
+	pathBudget       func() (int, error)
+	refreshPackets   uint32
+	dataMessages     uint32
+	now              func() time.Time
+}
+
+func minimumMessageSize() int { return 16 + len(templates()) }
+
+func paddedSize(n int) int { return (n + 3) &^ 3 }
+
+func (e *exporter) limit() int {
+	configured := e.maxMessageSize
+	if configured == 0 {
+		configured = defaultMaxMessageSize
+	}
+	if e.messageLimit != 0 {
+		return min(configured, e.messageLimit)
+	}
+	return configured
+}
+
+func (e *exporter) refreshPathBudget() error {
+	if e.pathBudget == nil {
+		return nil
+	}
+	budget, err := e.pathBudget()
+	if err != nil {
+		return fmt.Errorf("query IPFIX path MTU: %w", err)
+	}
+	if budget <= 0 {
+		return fmt.Errorf("invalid IPFIX path MTU budget %d", budget)
+	}
+	if e.limit() < minimumMessageSize() && e.pathMTUBudget != 0 && budget > e.pathMTUBudget {
+		e.messageLimit = budget
+	} else {
+		e.messageLimit = min(e.limit(), budget)
+	}
+	e.pathMTUBudget = budget
+	if e.limit() < minimumMessageSize() {
+		return fmt.Errorf("IPFIX path budget %d cannot carry the %d-byte templates", e.limit(), minimumMessageSize())
+	}
+	return nil
+}
+
+func (e *exporter) reduceMessageSize(err error) error {
+	if !errors.Is(err, syscall.EMSGSIZE) {
+		return err
+	}
+	old := e.limit()
+	reduced := old / 2
+	var queryErr error
+	if e.pathBudget != nil {
+		var budget int
+		budget, queryErr = e.pathBudget()
+		if queryErr == nil && budget > 0 {
+			e.pathMTUBudget = budget
+			if budget < old {
+				reduced = budget
+			}
+		} else if queryErr == nil {
+			queryErr = fmt.Errorf("invalid IPFIX path MTU budget %d", budget)
+		}
+	}
+	// Retain the smaller limit across socket recreation; never retry the same oversized batch.
+	e.messageLimit = reduced
+	return errors.Join(err, queryErr, fmt.Errorf("IPFIX message budget reduced from %d to %d bytes after EMSGSIZE", old, reduced))
 }
 
 func (e *exporter) message(set []byte, count uint32, now time.Time) error {
-	body := templates()
-	body = append(body, set...)
+	if 16+len(set) > e.limit() {
+		return fmt.Errorf("IPFIX message needs %d bytes but its budget is %d", 16+len(set), e.limit())
+	}
 	b := put16(nil, 10)
-	b = put16(b, uint16(16+len(body)))
+	b = put16(b, uint16(16+len(set)))
 	b = binary.BigEndian.AppendUint32(b, uint32(now.Unix()))
 	b = binary.BigEndian.AppendUint32(b, e.sequence)
 	b = binary.BigEndian.AppendUint32(b, e.domain)
-	b = append(b, body...)
-	if len(b) > maxMessage {
-		return fmt.Errorf("IPFIX message exceeds maximum size")
-	}
+	b = append(b, set...)
 	n, err := e.out.Write(b)
 	if err != nil {
-		return fmt.Errorf("send IPFIX UDP message: %w", err)
+		return fmt.Errorf("send IPFIX UDP message: %w", e.reduceMessageSize(err))
 	}
 	if n != len(b) {
 		return io.ErrShortWrite
 	}
 	e.sequence += count
+	return nil
+}
+
+func (e *exporter) refreshTemplates(now time.Time) error {
+	if !e.lastTemplate.IsZero() && now.Sub(e.lastTemplate) < e.refresh &&
+		(e.refreshPackets == 0 || e.dataMessages < e.refreshPackets) {
+		return nil
+	}
+	if err := e.message(templates(), 0, now); err != nil {
+		return err
+	}
 	e.lastTemplate = now
+	e.dataMessages = 0
 	return nil
 }
 
@@ -139,42 +220,53 @@ func (e *exporter) sendAcknowledged(records []Record, now time.Time) (int, error
 			return 0, fmt.Errorf("unsupported IPFIX address family %d", record.Family)
 		}
 	}
-	if len(records) == 0 {
-		if e.lastTemplate.IsZero() || now.Sub(e.lastTemplate) >= e.refresh {
-			return 0, e.message(nil, 0, now)
-		}
-		return 0, nil
+	if err := e.refreshTemplates(now); err != nil {
+		return 0, err
 	}
 	sent := 0
 	for sent < len(records) {
-		family := records[sent].Family
-		set := put16(nil, templateID(family))
-		set = put16(set, 0)
+		var body []byte
 		var count uint32
-		for _, record := range records[sent:] {
-			if record.Family != family {
+		for sent+int(count) < len(records) {
+			family := records[sent+int(count)].Family
+			set := put16(nil, templateID(family))
+			set = put16(set, 0)
+			start := count
+			for _, record := range records[sent+int(count):] {
+				if record.Family != family {
+					break
+				}
+				b, err := encodeRecord(record, e.bootUnixNS, e.samplingRate)
+				if err != nil {
+					return sent, err
+				}
+				if 16+len(body)+paddedSize(len(set)+len(b)) > e.limit() {
+					break
+				}
+				set = append(set, b...)
+				count++
+			}
+			if count == start {
 				break
 			}
-			b, err := encodeRecord(record, e.bootUnixNS, e.samplingRate)
-			if err != nil {
-				return sent, err
-			}
-			if 16+len(templates())+len(set)+len(b)+3 > maxMessage {
-				break
-			}
-			set = append(set, b...)
-			count++
+			set = append(set, make([]byte, paddedSize(len(set))-len(set))...)
+			binary.BigEndian.PutUint16(set[2:4], uint16(len(set)))
+			body = append(body, set...)
 		}
 		if count == 0 {
 			return sent, fmt.Errorf("IPFIX record exceeds message budget")
 		}
-		for len(set)%4 != 0 {
-			set = append(set, 0)
+		sentAt := now
+		if e.now != nil {
+			sentAt = e.now()
 		}
-		binary.BigEndian.PutUint16(set[2:4], uint16(len(set)))
-		if err := e.message(set, count, now); err != nil {
+		if err := e.refreshTemplates(sentAt); err != nil {
 			return sent, err
 		}
+		if err := e.message(body, count, sentAt); err != nil {
+			return sent, err
+		}
+		e.dataMessages++
 		sent += int(count)
 	}
 	return sent, nil

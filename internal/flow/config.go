@@ -21,6 +21,8 @@ type Config struct {
 	IdleTimeout                 string `yaml:"idle_timeout"`
 	PollInterval                string `yaml:"poll_interval"`
 	TemplateRefresh             string `yaml:"template_refresh"`
+	TemplateRefreshPackets      uint32 `yaml:"template_refresh_packets"`
+	MaxMessageSize              int    `yaml:"max_message_size"`
 	MaxFlowsPerVeth             uint32 `yaml:"max_flows_per_veth"`
 	SamplingRate                uint32 `yaml:"sampling_rate"`
 	CaptureFilter               string `yaml:"capture_filter"`
@@ -41,7 +43,8 @@ func LoadConfig(path string) (Config, error) {
 
 func readConfig(r io.Reader) (Config, error) {
 	c := Config{ActiveTimeout: "60s", IdleTimeout: "15s", PollInterval: "1s",
-		TemplateRefresh: "30s", MaxFlowsPerVeth: 65536, SamplingRate: 1}
+		TemplateRefresh: "30s", TemplateRefreshPackets: 20, MaxMessageSize: defaultMaxMessageSize,
+		MaxFlowsPerVeth: 65536, SamplingRate: 1}
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return c, err
@@ -66,7 +69,7 @@ func readConfig(r io.Reader) (Config, error) {
 		key, value := root.Content[i], root.Content[i+1]
 		tag := "!!str"
 		switch key.Value {
-		case "observation_domain_id", "max_flows_per_veth", "sampling_rate":
+		case "observation_domain_id", "max_flows_per_veth", "sampling_rate", "max_message_size", "template_refresh_packets":
 			tag = "!!int"
 		case "collector", "active_timeout", "idle_timeout", "poll_interval", "template_refresh", "capture_filter":
 		default:
@@ -107,6 +110,12 @@ func readConfig(r io.Reader) (Config, error) {
 	}
 	if c.refresh > 10*time.Minute {
 		return c, fmt.Errorf("template_refresh must not exceed 10m")
+	}
+	if c.MaxMessageSize < minimumMessageSize() || c.MaxMessageSize > 65507 {
+		return c, fmt.Errorf("max_message_size must be between %d and 65507 IPFIX payload bytes", minimumMessageSize())
+	}
+	if c.TemplateRefreshPackets > 1000000 {
+		return c, fmt.Errorf("template_refresh_packets must be between 0 and 1000000; 0 disables packet-based refresh")
 	}
 	if c.MaxFlowsPerVeth < 1 || c.MaxFlowsPerVeth > 1048576 {
 		return c, fmt.Errorf("max_flows_per_veth must be between 1 and 1048576")

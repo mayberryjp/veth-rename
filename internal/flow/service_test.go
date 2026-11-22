@@ -64,8 +64,9 @@ func testService(t *testing.T) (*Service, *fakeMeter, *datagrams, *uint64, Key) 
 func allRecords(t *testing.T, out *datagrams) []map[uint16][]byte {
 	t.Helper()
 	var records []map[uint16][]byte
+	var decoder recordDecoder
 	for _, b := range out.packets {
-		records = append(records, decodeRecords(t, b)...)
+		records = append(records, decoder.decode(t, b)...)
 	}
 	return records
 }

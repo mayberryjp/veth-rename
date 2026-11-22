@@ -51,6 +51,8 @@ active_timeout: 60s
 idle_timeout: 15s
 poll_interval: 1s
 template_refresh: 30s
+template_refresh_packets: 20
+max_message_size: 464
 max_flows_per_veth: 65536
 sampling_rate: 1
 capture_filter: ""
@@ -60,6 +62,16 @@ capture_filter: ""
 UDP. Choose a distinct observation domain per exporter host. Other settings
 have the defaults above (domain defaults to zero). Durations must be at least
 1ms; polling must not exceed either timeout; template refresh is at most 10m.
+`template_refresh_packets` is 0..1000000; the default refreshes templates after
+20 successful data messages, and zero disables only packet-based refresh.
+`max_message_size` is the maximum IPFIX UDP payload, 156..65507 bytes. The
+default 464 leaves room for base IPv6/UDP headers within a 512-byte packet.
+For a verified 1280-byte effective WireGuard path MTU, 1200 is a suitable
+payload limit. Account for any additional encapsulation or IP headers when
+choosing a larger value; an interface MTU alone does not prove the path MTU.
+Linux nonfragmenting PMTU discovery clamps the configured payload to the
+socket's current path estimate, subtracting 28 bytes for IPv4/UDP or 48 for
+IPv6/UDP. A path too small for the 156-byte templates is an explicit error.
 `sampling_rate` is 1..1000000; 1 observes every packet, 4 examines every fourth
 packet. A shared atomic sequence per veth spans ingress and egress, before
 parsing or exclusions (including non-IP frames). Counters describe samples,
@@ -109,15 +121,19 @@ kernel exclusion cannot diverge from the export destination.
   are no protocol-specific timers.
 - UDP IPFIX version 10 messages use network byte order, distinct IPv4/IPv6
   template IDs (256/257), zero Set padding, and sequence numbers counting
-  **Data Records**, not templates or datagrams. **Every message** begins with
-  both IPv4 and IPv6 templates, followed by any data. Template-only refresh
-  also continues while idle; `template_refresh` controls that idle interval,
-  not whether templates accompany data. The collector's UDP template lifetime
-  should be at least three times `template_refresh`. No Template Withdrawals
-  are sent over UDP. Messages are at most 464 bytes, so IPv6 plus UDP headers
-  fit the RFC 7011 conservative 512-byte packet recommendation.
-- Due records are batched within that size limit rather than sent one per
-  datagram. Each successful datagram acknowledges only its own records;
+  **Data Records**, not templates or datagrams. Both templates are sent in a
+  separate message at startup and after socket recreation, before dependent
+  data. Data messages use the collector's cached templates; they no longer
+  repeat templates in every message. Refresh occurs when `template_refresh`
+  elapses or `template_refresh_packets` successful data messages have been
+  sent, whichever occurs first, including during continuous traffic.
+  Refresh is checked on polling and between data batches; idle refresh still
+  continues. The collector's UDP template lifetime should be at least three
+  times `template_refresh`. No Template Withdrawals are sent over UDP.
+- Due records are batched by complete serialized byte size, with exact zero
+  padding, rather than sent one per datagram. A message may contain both IPv4
+  and IPv6 Data Sets; records are never split or reordered. Each successful
+  datagram acknowledges only its own records;
   partial batch failures retain the remaining records without replaying
   already accepted data.
 - The selected UDP transport follows RFC 7011's UDP wire requirements.
@@ -127,12 +143,22 @@ kernel exclusion cannot diverge from the export destination.
 - UDP is not reliable or encrypted. A successful send is not a collector
   acknowledgment; use a trusted, provisioned management network and tolerate
   loss/reordering. Sequence gaps let collectors detect lost datagrams.
+  Collectors must cache templates per transport session and observation
+  domain. A lost template message can leave data undecodable until refresh.
   Socket failures retain unsent deltas for retry; process death loses
   unexported in-memory state.
 - Export failures close the failed socket and retry with exponential backoff
   from 1 second up to 30 seconds. Metering and bounded buffering continue
   during an outage. Socket recreation preserves flow/pending state and the
   observation domain; a new UDP session starts with a fresh sequence number.
+  `EMSGSIZE` errors reduce the message budget to the reported PMTU payload,
+  or halve it if no smaller usable estimate is available, and retain the
+  unsent suffix for rebatching after backoff. PMTU query failures remain
+  explicit errors. The smaller limit survives reconnection, even if the new
+  socket starts with a larger estimate. If the budget cannot carry templates,
+  no oversized template is repeatedly sent; retries can recover when the
+  kernel subsequently reports a larger PMTU. Otherwise restart to increase
+  a previously reduced limit.
   Shutdown detaches capture first and uses a two-second overall flush budget,
   not a timeout per flow. Unexported leftovers are explicit errors. Only error
   logs are provided; no status API, status file, or periodic summaries exist.

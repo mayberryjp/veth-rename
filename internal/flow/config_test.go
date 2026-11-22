@@ -11,7 +11,8 @@ import (
 func TestConfigYAML(t *testing.T) {
 	c, err := readConfig(strings.NewReader("collector: '[2001:db8::1]:4739'\n"))
 	if err != nil || c.active != time.Minute || c.idle != 15*time.Second ||
-		c.poll != time.Second || c.refresh != 30*time.Second || c.MaxFlowsPerVeth != 65536 || c.SamplingRate != 1 {
+		c.poll != time.Second || c.refresh != 30*time.Second || c.MaxFlowsPerVeth != 65536 || c.SamplingRate != 1 ||
+		c.MaxMessageSize != defaultMaxMessageSize || c.TemplateRefreshPackets != 20 {
 		t.Fatalf("defaults: %+v %v", c, err)
 	}
 	for _, filter := range []string{"", "ip", "ip6", "tcp", "udp", "icmp", "icmp6"} {
@@ -32,9 +33,22 @@ func TestConfigYAML(t *testing.T) {
 		"collector: localhost:4739\nmax_flows_per_veth: 1048577", "collector: localhost:4739\ntemplate_refresh: 11m",
 		"collector: localhost:4739\ncapture_filter: 'udp port 53'", "collector: localhost:4739\nidle_timeout: null",
 		"collector: 1234", "collector: &a localhost:4739\ncapture_filter: *a",
+		"collector: localhost:4739\nmax_message_size: 155", "collector: localhost:4739\nmax_message_size: 65508",
+		"collector: localhost:4739\nmax_message_size: '1200'", "collector: localhost:4739\nmax_message_size: 1200.5",
+		"collector: localhost:4739\ntemplate_refresh_packets: -1", "collector: localhost:4739\ntemplate_refresh_packets: 1000001",
+		"collector: localhost:4739\ntemplate_refresh_packets: '20'", "collector: localhost:4739\nmax_message_size: null",
 	} {
 		if _, err := readConfig(strings.NewReader(input)); err == nil {
 			t.Errorf("accepted invalid YAML %q", input)
+		}
+	}
+}
+
+func TestConfigMessageAndTemplateLimits(t *testing.T) {
+	for _, size := range []string{"156", "464", "1200", "65507"} {
+		c, err := readConfig(strings.NewReader("collector: localhost:4739\nmax_message_size: " + size + "\ntemplate_refresh_packets: 0\n"))
+		if err != nil || c.TemplateRefreshPackets != 0 {
+			t.Fatalf("valid message limit %s rejected: %v", size, err)
 		}
 	}
 }

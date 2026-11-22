@@ -4,6 +4,8 @@ active_timeout: 60s
 idle_timeout: 15s
 poll_interval: 1s
 template_refresh: 30s
+template_refresh_packets: 20
+max_message_size: 464
 max_flows_per_veth: 65536
 sampling_rate: 1
 capture_filter: ""

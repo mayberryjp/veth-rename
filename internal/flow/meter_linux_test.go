@@ -282,11 +282,12 @@ func testKernelLiveVeth(t *testing.T, samplingRate uint32) {
 				return b[:n]
 			}
 			template := readUDP()
-			decodeTemplates(t, template)
+			var decoder recordDecoder
+			decoder.decode(t, template)
 			received := make(map[Key]bool)
 			for attempts := 0; attempts < 16; attempts++ {
 				b := readUDP()
-				records := decodeRecords(t, b)
+				records := decoder.decode(t, b)
 				if len(records) == 0 {
 					continue
 				}

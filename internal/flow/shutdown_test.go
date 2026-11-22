@@ -28,7 +28,7 @@ func TestShutdownUsesOneDeadlineAcrossAllBatches(t *testing.T) {
 	s.writer = &udpWriter{conn: conn}
 	s.export.out = s.writer
 	o := s.interfaces[7]
-	for i := 0; i < 150; i++ {
+	for i := 0; i < 300; i++ {
 		o.pending = append(o.pending, Record{Key: key, Counters: Counters{Packets: 1, Octets: 28}})
 	}
 	start := time.Now()

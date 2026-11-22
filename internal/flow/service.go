@@ -75,6 +75,9 @@ func New(ctx context.Context, c Config) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect IPFIX collector: %w", err)
 	}
+	if err := configureUDP(conn); err != nil {
+		return nil, errors.Join(err, conn.Close())
+	}
 	remote, ok := conn.RemoteAddr().(*net.UDPAddr)
 	if !ok {
 		return nil, errors.Join(fmt.Errorf("collector has no UDP address"), conn.Close())
@@ -96,10 +99,23 @@ func New(ctx context.Context, c Config) (*Service, error) {
 		options: options, clock: monotonic, now: time.Now, writer: &udpWriter{conn: conn}}
 	// Preserve the resolved destination across retries so capture exclusion stays exact.
 	s.connect = func(ctx context.Context) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "udp", remote.String())
+		conn, err := (&net.Dialer{}).DialContext(ctx, "udp", remote.String())
+		if err != nil {
+			return nil, err
+		}
+		if err := configureUDP(conn); err != nil {
+			return nil, errors.Join(err, conn.Close())
+		}
+		return conn, nil
 	}
 	s.export = exporter{out: s.writer, domain: c.ObservationDomainID,
-		bootUnixNS: time.Now().UnixNano() - int64(mono), refresh: c.refresh, samplingRate: c.SamplingRate}
+		bootUnixNS: time.Now().UnixNano() - int64(mono), refresh: c.refresh, samplingRate: c.SamplingRate,
+		maxMessageSize: c.MaxMessageSize, refreshPackets: c.TemplateRefreshPackets,
+		pathBudget: func() (int, error) { return udpMessageBudget(s.writer.conn) },
+		now:        func() time.Time { return s.now() }}
+	if err := s.export.refreshPathBudget(); err != nil {
+		return nil, errors.Join(err, conn.Close())
+	}
 	if err := s.export.send(nil, time.Now()); err != nil {
 		return nil, errors.Join(err, conn.Close())
 	}
@@ -207,8 +223,12 @@ func (s *Service) exportPending(deadline time.Time, force bool) error {
 				return s.failExport(fmt.Errorf("reconnect IPFIX collector: %w", err))
 			}
 			s.writer.conn = conn
+			if err := s.export.refreshPathBudget(); err != nil {
+				return s.failExport(err)
+			}
 			s.export.lastTemplate = time.Time{}
 			s.export.sequence = 0
+			s.export.dataMessages = 0
 		}
 	}
 	for _, index := range s.indices() {
