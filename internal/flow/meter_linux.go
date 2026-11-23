@@ -32,6 +32,7 @@ type kernelMeter struct {
 	reader     *ringbuf.Reader
 	dropReader *ringbuf.Reader
 	dropLoss   uint64
+	ruleSpec   *ebpf.MapSpec
 }
 
 type meterOptions struct {
@@ -55,7 +56,7 @@ func platformReady() error {
 }
 
 func validateFirewall(p *firewall.Policy) error {
-	m, err := loadConfiguredMeter(meterOptions{samplingRate: 1, firewall: p})
+	m, err := loadConfiguredMeter(meterOptions{samplingRate: 1, firewall: &firewall.Policy{Config: p.Config}})
 	if err != nil {
 		return err
 	}
@@ -82,37 +83,30 @@ func loadConfiguredMeter(options meterOptions) (*kernelMeter, error) {
 	if options.ringBytes != 0 {
 		spec.Maps["packets"].MaxEntries = options.ringBytes
 	}
-	enabled, permitICMP, count := uint32(0), uint32(1), uint32(0)
+	enabled, permitICMP := uint32(0), uint32(1)
 	if options.firewall != nil && options.firewall.Config.Enabled {
-		enabled, count = 1, uint32(len(options.firewall.Kernel))
+		enabled = 1
 		if !options.firewall.Config.PermitAllICMP {
 			permitICMP = 0
 		}
 	}
 	if enabled == 0 {
 		spec.Maps["connections"].MaxEntries = 1
-		spec.Maps["rules"].MaxEntries = 1
+		spec.Maps["rules"].InnerMap.MaxEntries = 1
+		spec.Maps["rule_template"].MaxEntries = 1
 		spec.Maps["drops"].MaxEntries = 4096
 	} else if options.stateEntries != 0 {
 		spec.Maps["connections"].MaxEntries = options.stateEntries
 	}
 	if err := spec.RewriteConstants(map[string]interface{}{
 		"sampling_rate": samplingRate, "capture_filter": options.filter, "collector": options.collector,
-		"firewall_enabled": enabled, "permit_all_icmp": permitICMP, "rule_count": count,
+		"firewall_enabled": enabled, "permit_all_icmp": permitICMP,
 	}); err != nil {
 		return nil, fmt.Errorf("configure eBPF sampling: %w", err)
 	}
 	c, err := ebpf.NewCollection(spec)
 	if err != nil {
 		return nil, fmt.Errorf("load eBPF meter (Linux 6.6+ and BPF/NET_ADMIN capabilities required): %w", err)
-	}
-	if enabled != 0 {
-		for i, rule := range options.firewall.Kernel {
-			if err := c.Maps["rules"].Update(uint32(i), rule, ebpf.UpdateAny); err != nil {
-				c.Close()
-				return nil, fmt.Errorf("load firewall rule %d: %w", i, err)
-			}
-		}
 	}
 	reader, err := ringbuf.NewReader(c.Maps["packets"])
 	if err != nil {
@@ -121,12 +115,39 @@ func loadConfiguredMeter(options meterOptions) (*kernelMeter, error) {
 	}
 	m := &kernelMeter{collection: c, reader: reader}
 	if enabled != 0 {
+		m.ruleSpec = spec.Maps["rules"].InnerMap
+		if err := m.UpdateFirewall(options.firewall); err != nil {
+			return nil, errors.Join(err, m.Close())
+		}
 		m.dropReader, err = ringbuf.NewReader(c.Maps["drops"])
 		if err != nil {
 			return nil, errors.Join(fmt.Errorf("open firewall drops: %w", err), m.Close())
 		}
 	}
 	return m, nil
+}
+
+func (m *kernelMeter) UpdateFirewall(p *firewall.Policy) (updateErr error) {
+	if m.ruleSpec == nil {
+		return fmt.Errorf("firewall is not enabled on this meter")
+	}
+	if len(p.Kernel) > firewall.MaxRulesPerVeth {
+		return fmt.Errorf("at most %d rules per veth are supported", firewall.MaxRulesPerVeth)
+	}
+	table, err := ebpf.NewMap(m.ruleSpec)
+	if err != nil {
+		return fmt.Errorf("create veth firewall table: %w", err)
+	}
+	defer func() { updateErr = errors.Join(updateErr, table.Close()) }()
+	for i, rule := range p.Kernel {
+		if err := table.Update(uint32(i), rule, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("load veth firewall rule %d: %w", i, err)
+		}
+	}
+	if err := m.collection.Maps["rules"].Update(uint32(0), table, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("replace veth firewall table: %w", err)
+	}
+	return nil
 }
 
 func attachMeter(iface Interface, options meterOptions) (meter, error) {

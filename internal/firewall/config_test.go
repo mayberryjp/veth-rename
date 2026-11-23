@@ -2,6 +2,8 @@ package firewall
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -125,6 +127,104 @@ func TestSandoSyncRejectsInvalidResponseWithoutReplacingPolicy(t *testing.T) {
 	p, err := LoadPolicy(c)
 	if err != nil || len(p.Rules) != 0 {
 		t.Fatalf("empty sync: %+v %v", p, err)
+	}
+}
+
+func TestSandoSyncLargePolicyPartitionsPerVeth(t *testing.T) {
+	c := fixture(t)
+	entries := make([]map[string]interface{}, 600)
+	for i := range entries {
+		entries[i] = map[string]interface{}{"ignorelist_id": fmt.Sprint(i),
+			"src_ip": fmt.Sprintf("10.0.%d.%d", i/250, i%250+1),
+			"dst_ip": "203.0.113.1", "dst_port": 443, "protocol": 6}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewEncoder(w).Encode(entries); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer server.Close()
+	c.SandoEndpoint = server.URL
+	if _, err := Sync(context.Background(), c, server.Client()); err != nil {
+		t.Fatal(err)
+	}
+	p, err := LoadPolicy(c)
+	if err != nil || len(p.Rules) != 600 {
+		t.Fatalf("complete import: %v", err)
+	}
+	for _, endpoint := range []struct {
+		ip string
+		id uint32
+	}{{"10.0.0.1", 1}, {"10.0.2.100", 600}} {
+		selected, err := p.ForEndpoint(endpoint.ip, "")
+		if err != nil || len(selected.Kernel) != 1 || selected.Kernel[0].ID != endpoint.id {
+			t.Fatalf("endpoint %s: %+v %v", endpoint.ip, selected, err)
+		}
+	}
+	if _, err := p.ForEndpoint("", ""); err == nil || !strings.Contains(err.Error(), "rules per veth") {
+		t.Fatalf("unknown addresses must retain all applicable rules: %v", err)
+	}
+}
+
+func TestEndpointSelectionKeepsGlobalManualAndBroadRules(t *testing.T) {
+	rules := []Rule{
+		{ID: "manual", Direction: "egress", Action: "deny", Source: "10.99.0.1", Destination: "*", Protocol: "*"},
+		{ID: "other", Direction: "ingress", Action: "allow", Source: "10.0.0.2", Destination: "203.0.113.1", Protocol: "tcp", SandoMatch: true},
+		{ID: "subnet", Direction: "egress", Action: "allow", Source: "10.0.0.0/24", Destination: "203.0.113.2", Protocol: "udp", SandoMatch: true},
+		{ID: "reversed", Direction: "both", Action: "allow", Source: "203.0.113.3", Destination: "10.0.0.1", Protocol: "tcp", SandoMatch: true},
+		{ID: "global", Direction: "both", Action: "allow", Source: "*", Destination: "203.0.113.4", Protocol: "tcp", SandoMatch: true},
+	}
+	kernel, err := Compile(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Policy{Rules: rules, Kernel: kernel}
+	selected, err := p.ForEndpoint("10.0.0.1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []uint32{1, 3, 4, 5}
+	if len(selected.Kernel) != len(want) {
+		t.Fatalf("selected: %+v", selected.Kernel)
+	}
+	for i, rule := range selected.Kernel {
+		if rule.ID != want[i] || rule.Direction != kernel[want[i]-1].Direction {
+			t.Fatalf("selection changed ordering, IDs or direction: %+v", selected.Kernel)
+		}
+	}
+	for _, addresses := range [][2]string{{"not-an-ip", ""}, {"::1", ""}, {"", "10.0.0.1"}} {
+		if _, err := p.ForEndpoint(addresses[0], addresses[1]); err == nil {
+			t.Fatalf("accepted endpoint %v", addresses)
+		}
+	}
+}
+
+func TestEndpointIPv6AndPerVethLimit(t *testing.T) {
+	rules := []Rule{
+		{ID: "local", Direction: "both", Action: "allow", Source: "2001:db8::/64", Destination: "2001:db8:2::1", Protocol: "tcp", SandoMatch: true},
+		{ID: "other", Direction: "both", Action: "allow", Source: "2001:db8:3::1", Destination: "2001:db8:4::1", Protocol: "tcp", SandoMatch: true},
+		{ID: "link-local", Direction: "both", Action: "allow", Source: "fe80::1", Destination: "fe80::2", Protocol: "icmp6", SandoMatch: true},
+	}
+	kernel, err := Compile(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Policy{Rules: rules, Kernel: kernel}
+	selected, err := p.ForEndpoint("", "2001:db8::5")
+	if err != nil || len(selected.Kernel) != 2 || selected.Kernel[1].ID != 3 {
+		t.Fatalf("IPv6: %+v %v", selected, err)
+	}
+	global := make([]Rule, MaxRulesPerVeth+1)
+	for i := range global {
+		global[i] = Rule{ID: fmt.Sprint(i), Direction: "both", Action: "allow", Source: "*", Destination: "*", Protocol: "*", SandoMatch: true}
+	}
+	kernel, err = Compile(global)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p = &Policy{Rules: global, Kernel: kernel}
+	if _, err := p.ForEndpoint("10.0.0.1", "2001:db8::1"); err == nil || !strings.Contains(err.Error(), "257 rules") {
+		t.Fatalf("global rules must count towards each veth: %v", err)
 	}
 }
 

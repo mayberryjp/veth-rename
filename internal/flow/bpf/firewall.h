@@ -9,14 +9,26 @@ struct firewall_rule {
 
 const volatile __u32 firewall_enabled = 0;
 const volatile __u32 permit_all_icmp = 1;
-const volatile __u32 rule_count = 0;
 
-struct {
+struct firewall_table {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 256);
     __type(key, __u32);
     __type(value, struct firewall_rule);
-} rules SEC(".maps");
+};
+
+struct firewall_table rule_template SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __array(values, struct firewall_table);
+} rules SEC(".maps") = {
+    .values = {
+        [0] = &rule_template,
+    },
+};
 
 struct state_value {
     struct bpf_spin_lock lock;
@@ -203,15 +215,16 @@ static __noinline int remember(struct flow_key *key, __u8 direction,
 
 struct rule_context {
     struct flow_key key;
+    void *table;
     __u32 matched;
     __u8 direction, action;
 };
 
 static long find_rule(__u32 index, void *data) {
     struct rule_context *context = data;
-    if (index >= rule_count)
+    struct firewall_rule *r = bpf_map_lookup_elem(context->table, &index);
+    if (!r || !r->id)
         return 1;
-    struct firewall_rule *r = bpf_map_lookup_elem(&rules, &index);
     if (r && rule_matches(r, &context->key, context->direction)) {
         context->matched = r->id;
         context->action = r->action;
@@ -231,6 +244,11 @@ static __noinline int firewall(struct flow_key *key, __u8 direction,
     if (established(key, direction, flags, now))
         return -1;
     struct rule_context context = {.key = *key, .direction = direction};
+    __u32 slot = 0;
+    // Snapshot one immutable table for the entire packet, including callback iterations.
+    context.table = bpf_map_lookup_elem(&rules, &slot);
+    if (!context.table)
+        return deny(key, direction, 0, 5, octets);
     bpf_loop(256, find_rule, &context, 0);
     if (context.matched) {
         if (!context.action)

@@ -21,6 +21,19 @@ type Drop struct {
 
 type firewallMeter interface {
 	ReadDrops() ([]Drop, error)
+	UpdateFirewall(*firewall.Policy) error
+}
+
+func (s *Service) firewallOptions(iface Interface) (meterOptions, error) {
+	options := s.options
+	if options.firewall != nil {
+		selected, err := options.firewall.ForEndpoint(iface.IPv4, iface.IPv6)
+		if err != nil {
+			return options, fmt.Errorf("firewall %s: %w", iface.Name, err)
+		}
+		options.firewall = selected
+	}
+	return options, nil
 }
 
 func (s *Service) EnableFirewall(p *firewall.Policy) error {
@@ -73,7 +86,7 @@ func writeDrop(out io.Writer, host string, iface Interface, policy *firewall.Pol
 	if drop.Direction == 2 {
 		direction = "egress"
 	}
-	reasons := [...]string{"default-deny", "rule-deny", "malformed", "unsupported-or-fragment", "state-table-full"}
+	reasons := [...]string{"default-deny", "rule-deny", "malformed", "unsupported-or-fragment", "state-table-full", "policy-unavailable"}
 	if drop.Reason >= uint8(len(reasons)) || (drop.Direction != 1 && drop.Direction != 2) {
 		return fmt.Errorf("invalid firewall drop direction or reason")
 	}

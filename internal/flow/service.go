@@ -301,11 +301,32 @@ func (s *Service) Sync(interfaces []Interface) error {
 	for _, iface := range interfaces {
 		if o, ok := s.interfaces[iface.Index]; ok {
 			if !o.retiring {
+				if s.options.firewall != nil && (iface.IPv4 != o.iface.IPv4 || iface.IPv6 != o.iface.IPv6) {
+					options, err := s.firewallOptions(iface)
+					if err != nil {
+						errs = append(errs, err)
+						continue
+					}
+					updater, ok := o.meter.(firewallMeter)
+					if !ok {
+						errs = append(errs, fmt.Errorf("meter %s has no firewall updater", iface.Name))
+						continue
+					}
+					if err := updater.UpdateFirewall(options.firewall); err != nil {
+						errs = append(errs, fmt.Errorf("update firewall %s: %w", iface.Name, err))
+						continue
+					}
+				}
 				o.iface = iface
 			}
 			continue
 		}
-		m, err := s.attach(iface, s.options)
+		options, err := s.firewallOptions(iface)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		m, err := s.attach(iface, options)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("monitor %s: %w", iface.Name, err))
 			continue

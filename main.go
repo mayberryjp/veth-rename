@@ -88,7 +88,7 @@ func monitoredInterfaces(mappings []mapping) []flow.Interface {
 			continue
 		}
 		interfaces = append(interfaces, flow.Interface{Index: m.IfIndex, Name: m.Interface,
-			Identity: m.ContainerID + "/" + m.NetworkID})
+			Identity: m.ContainerID + "/" + m.NetworkID, IPv4: m.IPv4, IPv6: m.IPv6})
 	}
 	return interfaces
 }

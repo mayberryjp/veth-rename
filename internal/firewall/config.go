@@ -13,7 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const MaxRules = 256
+const MaxRulesPerVeth = 256
 
 type Config struct {
 	Enabled        bool   `yaml:"enabled"`
@@ -230,8 +230,8 @@ func number(s string, bits int) (uint64, error) {
 }
 
 func Compile(rules []Rule) ([]KernelRule, error) {
-	if len(rules) > MaxRules {
-		return nil, fmt.Errorf("at most %d combined manual and Sando rules are supported", MaxRules)
+	if uint64(len(rules)) > uint64(^uint32(0)) {
+		return nil, fmt.Errorf("policy exceeds the rule ID range")
 	}
 	out := make([]KernelRule, 0, len(rules))
 	ids := make(map[string]bool)
@@ -248,6 +248,69 @@ func Compile(rules []Rule) ([]KernelRule, error) {
 		out = append(out, k)
 	}
 	return out, nil
+}
+
+// Manual rules are global. Sando rules are assigned by endpoint IP, not list position.
+func (p *Policy) ForEndpoint(ipv4, ipv6 string) (*Policy, error) {
+	var addresses [2]netip.Addr
+	for i, text := range []string{ipv4, ipv6} {
+		if text == "" {
+			continue
+		}
+		a, err := netip.ParseAddr(text)
+		if err != nil || a.Is4In6() || a.Zone() != "" || (i == 0 && !a.Is4()) || (i == 1 && !a.Is6()) {
+			return nil, fmt.Errorf("invalid endpoint IPv%d address %q", 4+i*2, text)
+		}
+		if !a.IsUnspecified() {
+			addresses[i] = a
+		}
+	}
+	selected := &Policy{Config: p.Config, Rules: p.Rules}
+	for _, rule := range p.Kernel {
+		if rule.Flags&8 == 0 || relevant(rule, addresses) {
+			selected.Kernel = append(selected.Kernel, rule)
+		}
+	}
+	if len(selected.Kernel) > MaxRulesPerVeth {
+		return nil, fmt.Errorf("%d rules apply to this veth; at most %d rules per veth are supported (IPv4=%q IPv6=%q)",
+			len(selected.Kernel), MaxRulesPerVeth, ipv4, ipv6)
+	}
+	return selected, nil
+}
+
+func relevant(rule KernelRule, addresses [2]netip.Addr) bool {
+	if rule.Family == 0 {
+		return true
+	}
+	index := 0
+	if rule.Family == 6 {
+		index = 1
+	}
+	a := addresses[index]
+	// Missing Docker metadata is not proof that traffic of this family is impossible.
+	if !a.IsValid() {
+		return true
+	}
+	for _, endpoint := range []struct {
+		address [16]byte
+		bits    uint8
+	}{{rule.Source, rule.SourcePrefix}, {rule.Destination, rule.DestinationPrefix}} {
+		network := netip.AddrFrom16(endpoint.address)
+		unspecified := netip.IPv6Unspecified()
+		if rule.Family == 4 {
+			network = netip.AddrFrom4([4]byte(endpoint.address[:4]))
+			unspecified = netip.IPv4Unspecified()
+		}
+		prefix := netip.PrefixFrom(network, int(endpoint.bits))
+		if prefix.Contains(a) || prefix.Contains(unspecified) {
+			return true
+		}
+		// Docker reports the primary global IPv6 address, not automatic link-local addresses.
+		if rule.Family == 6 && prefix.Overlaps(netip.MustParsePrefix("fe80::/10")) {
+			return true
+		}
+	}
+	return false
 }
 
 func compileRule(r Rule) (KernelRule, error) {

@@ -300,9 +300,32 @@ required. Addresses accept literal IPv4/IPv6, CIDRs, or `"*"`. Protocols accept
 Optional `source_port` / `destination_port` accept decimal 0..65535 or `"*"`;
 omission means unconstrained. Zero remains a literal constraint. ICMP uses
 the exporter's zero source port and `(type << 8) | code` destination field,
-not transport ports. Rules must have unique IDs across both files, and the
-combined limit is 256. Manual matching preserves packet source/destination
-orientation.
+not transport ports. Rules must have unique IDs across both files. There is
+no global 256-rule limit on the saved policy: the limit is **256 applicable
+rules per veth**, including its manual and imported rules. Manual matching
+preserves packet source/destination orientation.
+
+All manual rules remain global and count toward every veth. At attachment,
+Sando rules are selected when either address constraint matches the
+container endpoint's Docker-reported IPv4/IPv6 address. Selection preserves
+CIDRs, bidirectional matching, direction, ordering and original rule IDs.
+Wildcards and broad CIDRs can apply to many or all veths and count toward
+each of those veths; the limit is never implemented by truncating the policy.
+
+When Docker reports an address change, reconciliation atomically replaces
+that veth's rule table without detaching either hook or clearing TCP/UDP
+state. Each packet sees one complete old or new table, not partially updated
+rules. Saved-policy changes still require restart. A failed or over-capacity
+refresh reports the veth name/count and retains its previous table.
+An over-capacity new veth is not attached and remains unprotected; other
+veths can still be reconciled.
+
+Missing or unspecified Docker addresses retain all Sando rules for that IP
+family rather than guessing which rules are irrelevant. IPv6 link-local
+constraints and unspecified-address constraints are also retained for
+automatic addressing. Consequently an endpoint without reliable Docker
+address metadata may still exceed its per-veth limit. Assignment is intended
+for ordinary container endpoints, not containers routing other hosts' IPs.
 
 Sando sync uses [mayberryjp/sando's ignore-list API](https://github.com/mayberryjp/sando/blob/main/src/routers/ignorelist.py):
 `GET <sando_endpoint>/api/ignorelist`. It accepts the JSON array of
@@ -324,10 +347,12 @@ sudo veth-renamer --firewall-config=/etc/veth-renamer/firewall.yaml --sando-dump
 ```
 
 Sync is explicit only: no startup or periodic downloads. HTTP errors, invalid
-responses, duplicate IDs, oversized policies and file-write failures exit
+responses, duplicate IDs, responses exceeding 4 MiB and file-write failures exit
 nonzero and preserve the last saved policy. A successful empty list removes
 all imported rules, not manual rules. Both rule files must exist before
 enabling the firewall; missing policy files are startup errors.
+Sync validates and saves the whole policy; the per-veth limit is checked by
+the daemon when attaching or refreshing each endpoint, not during sync.
 
 ### Capture, drops and deployment
 

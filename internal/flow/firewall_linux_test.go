@@ -95,7 +95,7 @@ func TestKernelFirewallRingLossNeverBypassesPolicy(t *testing.T) {
 }
 
 func TestKernelFirewallLastRuleAtCapacity(t *testing.T) {
-	rules := make([]firewall.Rule, firewall.MaxRules)
+	rules := make([]firewall.Rule, firewall.MaxRulesPerVeth)
 	for i := range rules {
 		rules[i] = firewall.Rule{ID: fmt.Sprintf("rule-%d", i), Direction: "egress", Action: "allow",
 			Source: "*", Destination: "*", Protocol: "udp", DestinationPort: fmt.Sprint(i)}
@@ -106,9 +106,15 @@ func TestKernelFirewallLastRuleAtCapacity(t *testing.T) {
 	verdict(t, m, "meter_egress", packet, ^uint32(0))
 	binary.BigEndian.PutUint16(packet[36:38], 256)
 	verdict(t, m, "meter_egress", packet, 2)
-	rules = append(rules, firewall.Rule{ID: "extra"})
-	if _, err := firewall.Compile(rules); err == nil {
-		t.Fatal("accepted policy beyond kernel capacity")
+	extra := rules[0]
+	extra.ID = "extra"
+	rules = append(rules, extra)
+	compiled, err := firewall.Compile(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UpdateFirewall(&firewall.Policy{Kernel: compiled}); err == nil {
+		t.Fatal("installed policy beyond per-veth kernel capacity")
 	}
 }
 
@@ -129,6 +135,57 @@ func TestKernelFirewallRuleOrderDirectionAndSandoMatch(t *testing.T) {
 	}
 }
 
+func TestKernelFirewallPartitionAndUpdatePreserveState(t *testing.T) {
+	rules := make([]firewall.Rule, 600)
+	for i := range rules {
+		rules[i] = firewall.Rule{ID: fmt.Sprint(i), Direction: "both", Action: "allow",
+			Source: fmt.Sprintf("10.0.%d.%d", i/250, i%250+1), Destination: "10.9.0.1",
+			Protocol: "udp", SandoMatch: true}
+	}
+	kernel, err := firewall.Compile(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &firewall.Policy{Config: firewall.Config{Enabled: true}, Rules: rules, Kernel: kernel}
+	selected, err := p.ForEndpoint("10.0.0.1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireKernel(t)
+	m, err := loadConfiguredMeter(meterOptions{samplingRate: 1, stateEntries: 1, firewall: selected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	packet := ipv4Packet(false, 1234)
+	copy(packet[30:34], []byte{10, 9, 0, 1})
+	verdict(t, m, "meter", packet, ^uint32(0))
+	copy(packet[26:30], []byte{10, 0, 2, 100})
+	verdict(t, m, "meter", packet, 2)
+	drops, err := m.ReadDrops()
+	if err != nil || len(drops) != 1 || drops[0].Rule != 0 {
+		t.Fatalf("other endpoint rule leaked: %+v %v", drops, err)
+	}
+	selected, err = p.ForEndpoint("10.0.2.100", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UpdateFirewall(selected); err != nil {
+		t.Fatal(err)
+	}
+	verdict(t, m, "meter", packet, 2)
+	drops, err = m.ReadDrops()
+	if err != nil || len(drops) != 1 || drops[0].Rule != 600 || drops[0].Reason != 4 {
+		t.Fatalf("stable global log ID and retained state: %+v %v", drops, err)
+	}
+	reply := ipv4Packet(true, 1234)
+	copy(reply[26:30], []byte{10, 9, 0, 1})
+	verdict(t, m, "meter_egress", reply, ^uint32(0))
+	copy(packet[26:30], []byte{10, 0, 0, 1})
+	binary.BigEndian.PutUint16(packet[34:36], 5678)
+	verdict(t, m, "meter", packet, 2)
+}
+
 func TestKernelFirewallICMPAndFragments(t *testing.T) {
 	m := firewallTestMeter(t, nil, true, 1, 0)
 	icmp := ipv4Packet(false, 1234)
@@ -142,6 +199,48 @@ func TestKernelFirewallICMPAndFragments(t *testing.T) {
 	fragment := ipv4Packet(false, 1234)
 	fragment[20] = 0x20
 	verdict(t, m, "meter", fragment, 2)
+}
+
+func TestKernelFirewallConcurrentRuleReplacement(t *testing.T) {
+	rules := []firewall.Rule{
+		{ID: "first", Direction: "both", Action: "deny", Source: "*", Destination: "*", Protocol: "udp"},
+		{ID: "second", Direction: "both", Action: "allow", Source: "*", Destination: "*", Protocol: "udp"},
+	}
+	m := firewallTestMeter(t, rules, true, 1, 0)
+	first, err := firewall.Compile(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules[0].Source = "10.99.0.1"
+	rules[1].Action = "deny"
+	second, err := firewall.Compile(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; i < 400; i++ {
+			got, _, err := m.collection.Programs["meter"].Test(ipv4Packet(false, 1234))
+			if err != nil || got != 2 {
+				done <- fmt.Errorf("partial policy permitted packet: verdict=%d error=%v", got, err)
+				return
+			}
+		}
+		done <- nil
+	}()
+	for i := 0; i < 50; i++ {
+		kernel := first
+		if i%2 == 0 {
+			kernel = second
+		}
+		if err = m.UpdateFirewall(&firewall.Policy{Kernel: kernel}); err != nil {
+			break
+		}
+	}
+	packetErr := <-done
+	if err != nil || packetErr != nil {
+		t.Fatalf("atomic replacement: update=%v packets=%v", err, packetErr)
+	}
 }
 
 func TestKernelFirewallTCPHandshakeAndExpiry(t *testing.T) {

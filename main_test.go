@@ -41,7 +41,7 @@ func TestLogScanErrorDeduplicatesFailures(t *testing.T) {
 
 func TestMonitoredInterfacesOnlyVerifiedManagedHostVeths(t *testing.T) {
 	records := []mapping{
-		{Namespace: "host", IfIndex: 7, Interface: "veth_app", ContainerID: "c1", NetworkID: "n1", Status: "applied"},
+		{Namespace: "host", IfIndex: 7, Interface: "veth_app", ContainerID: "c1", NetworkID: "n1", Status: "applied", IPv4: "10.0.0.1", IPv6: "2001:db8::1"},
 		{Namespace: "host", IfIndex: 8, Interface: "veth_other", Status: "monitored"},
 		{Namespace: "host", IfIndex: 9, Status: "unchanged"},
 		{Namespace: "container", IfIndex: 10, Status: "applied"},
@@ -52,6 +52,9 @@ func TestMonitoredInterfacesOnlyVerifiedManagedHostVeths(t *testing.T) {
 	got := monitoredInterfaces(records)
 	if len(got) != 3 || got[0].Index != 7 || got[0].Name != "veth_app" || got[0].Identity != "c1/n1" {
 		t.Fatalf("monitoring selection = %+v", got)
+	}
+	if got[0].IPv4 != "10.0.0.1" || got[0].IPv6 != "2001:db8::1" {
+		t.Fatalf("endpoint addresses missing: %+v", got[0])
 	}
 }
 

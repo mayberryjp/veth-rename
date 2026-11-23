@@ -53,6 +53,7 @@ func (c *Counters) add(p Packet) {
 type Interface struct {
 	Index          int
 	Name, Identity string
+	IPv4, IPv6     string
 }
 
 type Record struct {
