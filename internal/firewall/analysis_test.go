@@ -51,6 +51,68 @@ func TestAnalyzeDropsWindowAggregationAndRanking(t *testing.T) {
 	}
 }
 
+func TestAnalyzeDropsNormalizesReturnTraffic(t *testing.T) {
+	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name, source, destination, direction, reverseDirection string
+		protocol                                               int
+	}{
+		{"tcp-ingress", "10.0.0.1", "203.0.113.1", "ingress", "egress", 6},
+		{"tcp-egress", "10.0.0.1", "203.0.113.1", "egress", "ingress", 6},
+		{"udp-ipv6", "2001:db8::1", "2001:db8::2", "ingress", "egress", 17},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			record := func(source, destination, direction string, sourcePort, destinationPort, length int) string {
+				return fmt.Sprintf("%s host veth-renamer[123]: WOULD_DROP IF=\"app\" DIR=%s SRC=%s DST=%s PROTO=%d SPT=%d DPT=%d LEN=%d RULE=\"default\" REASON=default-deny TIME=%s\n",
+					now.Format(time.Stamp), direction, source, destination, tc.protocol, sourcePort, destinationPort, length, now.Format(time.RFC3339Nano))
+			}
+			input := record(tc.source, tc.destination, tc.direction, 40000, 443, 40) +
+				record(tc.destination, tc.source, tc.reverseDirection, 443, 40000, 60) +
+				record(tc.source, tc.destination, tc.direction, 50000, 443, 50) +
+				record(tc.destination, tc.source, tc.reverseDirection, 443, 50000, 70)
+			for _, sortBy := range []string{"packets", "bytes"} {
+				rows, err := AnalyzeDrops(strings.NewReader(input), now, time.Hour, sortBy)
+				if err != nil || len(rows) != 1 {
+					t.Fatalf("analysis: %+v %v", rows, err)
+				}
+				row := rows[0]
+				if row.Source != tc.source || row.Destination != tc.destination || row.DestinationPort != 443 ||
+					row.Direction != tc.direction || row.Protocol != uint16(tc.protocol) || row.Packets != 4 || row.Bytes != 220 {
+					t.Fatalf("incorrect normalized aggregate: %+v", row)
+				}
+			}
+			rows, err := AnalyzeDrops(strings.NewReader(record(tc.destination, tc.source, tc.reverseDirection, 443, 60000, 80)), now, time.Hour, "packets")
+			if err != nil || len(rows) != 1 || rows[0].Source != tc.source || rows[0].Destination != tc.destination ||
+				rows[0].DestinationPort != 443 || rows[0].Direction != tc.direction || rows[0].Packets != 1 || rows[0].Bytes != 80 {
+				t.Fatalf("return-only traffic: %+v %v", rows, err)
+			}
+		})
+	}
+}
+
+func TestAnalyzeDropsPreservesEqualPortsAndNonTransportRecords(t *testing.T) {
+	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name                   string
+		protocol, sport, dport int
+	}{
+		{"equal-tcp", 6, 443, 443},
+		{"equal-udp", 17, 53, 53},
+		{"icmp-type-code", 1, 0, 2048},
+		{"icmpv6-type-code", 58, 0, 32768},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := fmt.Sprintf("%s host veth-renamer[123]: DROP IF=\"app\" DIR=egress SRC=2001:db8::1 DST=2001:db8::2 PROTO=%d SPT=%d DPT=%d LEN=40 RULE=\"default\" REASON=default-deny TIME=%s\n",
+				now.Format(time.Stamp), tc.protocol, tc.sport, tc.dport, now.Format(time.RFC3339Nano))
+			rows, err := AnalyzeDrops(strings.NewReader(input), now, time.Hour, "packets")
+			if err != nil || len(rows) != 1 || rows[0].Source != "2001:db8::1" ||
+				rows[0].Destination != "2001:db8::2" || rows[0].DestinationPort != uint16(tc.dport) || rows[0].Direction != "egress" {
+				t.Fatalf("record changed: %+v %v", rows, err)
+			}
+		})
+	}
+}
+
 func TestAnalyzeDropsLegacyIPv6AndSeparateVerdicts(t *testing.T) {
 	now := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
 	legacy := `Dec 31 23:00:00 host veth-renamer[1]: DROP IF="veth" DIR=egress SRC=2001:db8::1 DST=2001:db8::2 PROTO=17 SPT=123 DPT=53 LEN=48 RULE="default" REASON=default-deny` + "\n"

@@ -88,12 +88,22 @@ func parseDropRecord(line string, now time.Time) (DropTuple, uint64, time.Time, 
 			return DropTuple{}, 0, time.Time{}, fmt.Errorf("invalid protocol, port or length: %w", err)
 		}
 	}
-	return DropTuple{
+	tuple := DropTuple{
 		Interface: iface, Direction: m[4], Action: m[2],
 		Source: sourceText, Destination: destinationText,
 		Protocol: uint16(numbers[0]), DestinationPort: uint16(numbers[2]),
 		Rule: rule, Reason: m[12],
-	}, numbers[3], when, nil
+	}
+	if (tuple.Protocol == 6 || tuple.Protocol == 17) && numbers[1] < numbers[2] {
+		tuple.Source, tuple.Destination = tuple.Destination, tuple.Source
+		tuple.DestinationPort = uint16(numbers[1])
+		if tuple.Direction == "ingress" {
+			tuple.Direction = "egress"
+		} else {
+			tuple.Direction = "ingress"
+		}
+	}
+	return tuple, numbers[3], when, nil
 }
 
 func AnalyzeDrops(input io.Reader, now time.Time, lookback time.Duration, sortBy string) ([]DropSummary, error) {

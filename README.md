@@ -321,9 +321,17 @@ The command prints a table and exits without loading policy files, attaching
 eBPF, changing rules, or contacting Docker/Sando. Despite its name,
 `--propose-rules` provides review evidence, not generated/applied allow rules.
 
-Rows aggregate source IP, destination IP, destination port and numeric IP
-protocol, ignoring ephemeral source ports. Interface, hook direction, verdict,
-rule ID and reason remain separate so independent rule matches and actual
+Before aggregation, TCP/UDP records with a source port lower than the destination
+port have their source/destination IPs swapped, destination port set to the
+original source port, and ingress/egress direction reversed. This groups replies
+under the lower service port rather than ephemeral client ports, even when only
+return traffic is logged. Equal-port records are unchanged. This port-order
+heuristic is not connection tracking and can misidentify unusual client/service
+port assignments.
+
+Rows aggregate normalized source IP, destination IP, destination port and numeric
+IP protocol, ignoring ephemeral client ports. Interface, normalized direction,
+verdict, rule ID and reason remain separate so independent rule matches and actual
 versus would-be drops are not conflated. `PACKETS` counts matching log records;
 `BYTES` sums `LEN`. ICMP's destination field is `(type << 8) | code`.
 No matching records produces only the table header. Malformed records and
