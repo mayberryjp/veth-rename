@@ -202,6 +202,7 @@ func run(log *slog.Logger) (runErr error) {
 				return err
 			}
 			log.Info("eBPF firewall enabled", "rules", len(firewallPolicy.Rules),
+				"audit_mode", firewallSettings.AuditMode,
 				"permit_all_icmp", firewallSettings.PermitAllICMP, "drop_log", firewallSettings.DropLog)
 		}
 		ticker := time.NewTicker(monitoring.PollInterval())

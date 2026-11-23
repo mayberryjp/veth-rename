@@ -105,4 +105,13 @@ func TestDropLogSyslogFormatAndEscaping(t *testing.T) {
 	if err := writeDrop(&out, "host", Interface{}, p, d, when); err == nil {
 		t.Fatal("accepted bad rule index")
 	}
+	out.Reset()
+	d.Rule = 1
+	p.Config.AuditMode = true
+	if err := writeDrop(&out, "host", Interface{Name: "veth_app"}, p, d, when); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), ": WOULD_DROP IF=") || strings.Contains(out.String(), ": DROP ") {
+		t.Fatalf("audit verdict mislabeled: %s", out.String())
+	}
 }

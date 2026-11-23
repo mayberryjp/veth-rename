@@ -32,19 +32,26 @@ func TestFirewallDefaultsAndDisabledConfig(t *testing.T) {
 			t.Fatal(err)
 		}
 		c, err := LoadConfig(path)
-		if err != nil || !c.PermitAllICMP {
+		if err != nil || !c.PermitAllICMP || c.AuditMode {
 			t.Fatalf("defaults: %+v %v", c, err)
 		}
 		if content == "{}" && c.Enabled {
 			t.Fatal("firewall enabled by default")
 		}
 	}
-	for _, content := range []string{"enabled: \"false\"", "enabled: null", "enabled: true", "enabled: false\nenabled: true", "unknown: true", "permit_all_icmp: null", "[]", "enabled: false\n---\n{}"} {
+	for _, content := range []string{"enabled: \"false\"", "enabled: null", "enabled: true", "enabled: false\nenabled: true", "unknown: true", "permit_all_icmp: null", "audit_mode: \"true\"", "audit_mode: null", "audit_mode: 1", "[]", "enabled: false\n---\n{}"} {
 		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := LoadConfig(path); err == nil {
 			t.Fatalf("accepted %q", content)
+		}
+		if err := os.WriteFile(path, []byte("enabled: false\naudit_mode: true\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := LoadConfig(path)
+		if err != nil || c.Enabled || !c.AuditMode {
+			t.Fatalf("explicit audit flag: %+v %v", c, err)
 		}
 	}
 }

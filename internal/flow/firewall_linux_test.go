@@ -17,13 +17,17 @@ import (
 )
 
 func firewallTestMeter(t *testing.T, rules []firewall.Rule, icmp bool, rate, filter uint32) *kernelMeter {
+	return configuredFirewallTestMeter(t, rules, firewall.Config{Enabled: true, PermitAllICMP: icmp}, rate, filter)
+}
+
+func configuredFirewallTestMeter(t *testing.T, rules []firewall.Rule, config firewall.Config, rate, filter uint32) *kernelMeter {
 	t.Helper()
 	requireKernel(t)
 	compiled, err := firewall.Compile(rules)
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &firewall.Policy{Config: firewall.Config{Enabled: true, PermitAllICMP: icmp}, Rules: rules, Kernel: compiled}
+	p := &firewall.Policy{Config: config, Rules: rules, Kernel: compiled}
 	m, err := loadConfiguredMeter(meterOptions{samplingRate: rate, filter: filter, firewall: p})
 	if err != nil {
 		var verifier *ebpf.VerifierError
@@ -38,6 +42,92 @@ func firewallTestMeter(t *testing.T, rules []firewall.Rule, icmp bool, rate, fil
 		}
 	})
 	return m
+}
+
+func TestKernelFirewallAuditVerdictsAndCapture(t *testing.T) {
+	rules := []firewall.Rule{{ID: "deny", Direction: "ingress", Action: "deny", Source: "*", Destination: "*", Protocol: "udp"}}
+	m := configuredFirewallTestMeter(t, rules, firewall.Config{Enabled: true, AuditMode: true}, 4, 0)
+	for i := 0; i < 8; i++ {
+		verdict(t, m, "meter", ipv4Packet(false, 1234), ^uint32(0))
+	}
+	verdict(t, m, "meter_egress", ipv4Packet(true, 1234), ^uint32(0))
+	fragment := ipv4Packet(false, 1234)
+	fragment[20] = 0x20
+	verdict(t, m, "meter", fragment, ^uint32(0))
+	bad := ipv4Packet(false, 1234)
+	bad[14] = 0x40
+	verdict(t, m, "meter", bad, ^uint32(0))
+	unsupported := make([]byte, 14)
+	verdict(t, m, "meter_egress", unsupported, ^uint32(0))
+	packets, err := m.Read()
+	if err != nil || len(packets) != 2 {
+		t.Fatalf("audit IPFIX sampling: %d %v", len(packets), err)
+	}
+	drops, err := m.ReadDrops()
+	if err != nil || len(drops) != 12 {
+		t.Fatalf("audit events: %d %v", len(drops), err)
+	}
+	for i, drop := range drops {
+		reason := uint8(1)
+		switch i {
+		case 8:
+			reason = 0
+		case 9, 11:
+			reason = 3
+		case 10:
+			reason = 2
+		}
+		if drop.Reason != reason {
+			t.Fatalf("event %d: %+v", i, drop)
+		}
+	}
+	disabled := configuredFirewallTestMeter(t, rules, firewall.Config{AuditMode: true}, 1, 0)
+	verdict(t, disabled, "meter", ipv4Packet(false, 1234), ^uint32(0))
+	if drops, err := disabled.ReadDrops(); err != nil || len(drops) != 0 {
+		t.Fatalf("disabled firewall audited traffic: %+v %v", drops, err)
+	}
+}
+
+func TestKernelFirewallAuditStateTracksOnlyPolicyAllows(t *testing.T) {
+	rules := []firewall.Rule{{ID: "udp", Direction: "ingress", Action: "allow", Source: "*", Destination: "*", Protocol: "udp", DestinationPort: "443"}}
+	m := configuredFirewallTestMeter(t, rules, firewall.Config{Enabled: true, AuditMode: true, PermitAllICMP: true}, 1, 0)
+	denied := ipv4Packet(false, 5678)
+	binary.BigEndian.PutUint16(denied[36:38], 444)
+	verdict(t, m, "meter", denied, ^uint32(0))
+	reply := ipv4Packet(true, 5678)
+	binary.BigEndian.PutUint16(reply[34:36], 444)
+	verdict(t, m, "meter_egress", reply, ^uint32(0))
+	verdict(t, m, "meter", ipv4Packet(false, 1234), ^uint32(0))
+	verdict(t, m, "meter_egress", ipv4Packet(true, 1234), ^uint32(0))
+	icmp := ipv4Packet(false, 1234)
+	icmp[23] = 1
+	verdict(t, m, "meter", icmp, ^uint32(0))
+	drops, err := m.ReadDrops()
+	if err != nil || len(drops) != 2 || drops[0].DestinationPort != 444 || drops[1].SourcePort != 444 {
+		t.Fatalf("audit state: %+v %v", drops, err)
+	}
+}
+
+func TestKernelFirewallAuditStateCapacityStillPermits(t *testing.T) {
+	requireKernel(t)
+	rules := []firewall.Rule{{ID: "udp", Direction: "ingress", Action: "allow", Source: "*", Destination: "*", Protocol: "udp"}}
+	compiled, err := firewall.Compile(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := loadConfiguredMeter(meterOptions{samplingRate: 1, stateEntries: 1,
+		firewall: &firewall.Policy{Config: firewall.Config{Enabled: true, AuditMode: true}, Rules: rules, Kernel: compiled}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	verdict(t, m, "meter", ipv4Packet(false, 1234), ^uint32(0))
+	verdict(t, m, "meter", ipv4Packet(false, 5678), ^uint32(0))
+	verdict(t, m, "meter_egress", ipv4Packet(true, 5678), ^uint32(0))
+	drops, err := m.ReadDrops()
+	if err != nil || len(drops) != 2 || drops[0].Reason != 4 || drops[1].Reason != 0 {
+		t.Fatalf("audit full state table: %+v %v", drops, err)
+	}
 }
 
 func verdict(t *testing.T, m *kernelMeter, program string, packet []byte, want uint32) {
@@ -323,6 +413,14 @@ func TestKernelFirewallStateCapacityAndUDPExpiry(t *testing.T) {
 }
 
 func TestKernelFirewallLiveTCXDrop(t *testing.T) {
+	testKernelFirewallLiveTCX(t, false)
+}
+
+func TestKernelFirewallAuditLiveTCX(t *testing.T) {
+	testKernelFirewallLiveTCX(t, true)
+}
+
+func testKernelFirewallLiveTCX(t *testing.T, audit bool) {
 	requireKernel(t)
 	ip := func(args ...string) {
 		t.Helper()
@@ -350,7 +448,7 @@ func TestKernelFirewallLiveTCXDrop(t *testing.T) {
 		t.Fatal(err)
 	}
 	attached, err := attachMeter(Interface{Index: host.Index, Name: host.Name}, meterOptions{samplingRate: 1,
-		firewall: &firewall.Policy{Config: firewall.Config{Enabled: true}, Rules: rules, Kernel: compiled}})
+		firewall: &firewall.Policy{Config: firewall.Config{Enabled: true, AuditMode: audit}, Rules: rules, Kernel: compiled}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,12 +478,17 @@ func TestKernelFirewallLiveTCXDrop(t *testing.T) {
 		binary.BigEndian.PutUint16(packet[36:38], port)
 		return unix.Sendto(tx, packet, 0, &unix.SockaddrLinklayer{Ifindex: host.Index, Protocol: htons(0x0800)})
 	}
-	if err := send(444); err != nil && !errors.Is(err, unix.ENOBUFS) {
+	if err := send(444); err != nil && (audit || !errors.Is(err, unix.ENOBUFS)) {
 		t.Fatal(err)
 	}
 	buffer := make([]byte, 1500)
-	if n, _, err := unix.Recvfrom(rx, buffer, 0); n > 0 || (!errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EWOULDBLOCK)) {
-		t.Fatalf("denied packet reached peer: n=%d err=%v", n, err)
+	n, _, recvErr := unix.Recvfrom(rx, buffer, 0)
+	if audit {
+		if recvErr != nil || n != len(packet) {
+			t.Fatalf("audit packet not delivered: n=%d err=%v", n, recvErr)
+		}
+	} else if n > 0 || (!errors.Is(recvErr, unix.EAGAIN) && !errors.Is(recvErr, unix.EWOULDBLOCK)) {
+		t.Fatalf("denied packet reached peer: n=%d err=%v", n, recvErr)
 	}
 	if err := send(443); err != nil {
 		t.Fatal(err)

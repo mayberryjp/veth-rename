@@ -1,5 +1,7 @@
 # Firewalling is opt-in; omitted enabled also defaults to false.
 enabled: false
+# Evaluate policy and log WOULD_DROP, but permit all traffic when enabled.
+audit_mode: false
 permit_all_icmp: true
 manual_rules: manual.yaml
 sando_rules: sando.yaml

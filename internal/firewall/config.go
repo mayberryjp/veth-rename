@@ -17,6 +17,7 @@ const MaxRulesPerVeth = 256
 
 type Config struct {
 	Enabled        bool   `yaml:"enabled"`
+	AuditMode      bool   `yaml:"audit_mode"`
 	PermitAllICMP  bool   `yaml:"permit_all_icmp"`
 	ManualRules    string `yaml:"manual_rules"`
 	SandoRules     string `yaml:"sando_rules"`
@@ -97,7 +98,7 @@ func validateNodes(n *yaml.Node) error {
 			if key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
 				return fmt.Errorf("mapping keys must be strings")
 			}
-			if (key.Value == "enabled" || key.Value == "permit_all_icmp" || key.Value == "sando_match") &&
+			if (key.Value == "enabled" || key.Value == "audit_mode" || key.Value == "permit_all_icmp" || key.Value == "sando_match") &&
 				(value.Kind != yaml.ScalarNode || value.Tag != "!!bool") {
 				return fmt.Errorf("%s must be a boolean", key.Value)
 			}

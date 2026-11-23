@@ -223,6 +223,7 @@ verified managed host-veth scope and Linux/capability requirements apply.
 
 ```yaml
 enabled: false
+audit_mode: false
 permit_all_icmp: true
 manual_rules: manual.yaml
 sando_rules: sando.yaml
@@ -237,6 +238,34 @@ ICMPv6), and `sando_direction` defaults to `both`. The three paths are required
 when enabled. Unknown/duplicate keys, nulls, aliases, invalid rules and multiple
 YAML documents are errors. Restart the daemon to load configuration or policy
 changes; a sync command never changes a running daemon's policy.
+
+### Audit mode (permit all, log would-be drops)
+
+Set `enabled: true` and `audit_mode: true` to evaluate the configured policy
+without dropping traffic. `audit_mode` defaults to **false**; an omitted or
+false setting preserves enforcement when the firewall is enabled.
+`enabled: false` disables both enforcement and auditing, regardless of
+`audit_mode`. Restart the service after changing either setting:
+
+```yaml
+enabled: true
+audit_mode: true
+```
+
+Audit mode uses the same rule order, system allowances, per-veth limits and
+TCP/UDP tracking. Only traffic permitted by the policy creates connection
+state; packets allowed solely because of audit mode do not create state.
+Would-be drops (including malformed/unsupported packets and state-table
+capacity failures) are logged as `WOULD_DROP` instead of `DROP` to the same
+`drop_log` file. Logging-buffer overflow never blocks traffic in audit mode.
+IPFIX capture still precedes the verdict and retains its sampling/exclusion
+semantics. Existing external firewalls can still drop traffic.
+
+Audit requires the same valid policy, IPFIX configuration, capabilities,
+successful attachment and writable log as enforcement. Startup logs include
+`audit_mode` so operators can distinguish the modes. Set `audit_mode: false`
+and restart to enforce the policy; restart clears connection state, so audit
+results are a preview, not a guarantee of identical future traffic.
 
 ### Order, direction and state
 

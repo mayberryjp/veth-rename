@@ -90,8 +90,12 @@ func writeDrop(out io.Writer, host string, iface Interface, policy *firewall.Pol
 	if drop.Reason >= uint8(len(reasons)) || (drop.Direction != 1 && drop.Direction != 2) {
 		return fmt.Errorf("invalid firewall drop direction or reason")
 	}
-	_, err := fmt.Fprintf(out, "%s %s veth-renamer[%d]: DROP IF=%q DIR=%s SRC=%s DST=%s PROTO=%d SPT=%d DPT=%d LEN=%d RULE=%q REASON=%s\n",
-		timestamp.Local().Format(time.Stamp), host, os.Getpid(), iface.Name, direction,
+	action := "DROP"
+	if policy.Config.AuditMode {
+		action = "WOULD_DROP"
+	}
+	_, err := fmt.Fprintf(out, "%s %s veth-renamer[%d]: %s IF=%q DIR=%s SRC=%s DST=%s PROTO=%d SPT=%d DPT=%d LEN=%d RULE=%q REASON=%s\n",
+		timestamp.Local().Format(time.Stamp), host, os.Getpid(), action, iface.Name, direction,
 		address(drop.Source, drop.Family), address(drop.Destination, drop.Family), drop.Protocol,
 		drop.SourcePort, drop.DestinationPort, drop.Octets, rule, reasons[drop.Reason])
 	return err
