@@ -5,10 +5,104 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
+	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
+	"veth-rename/internal/firewall"
 )
+
+func TestSandoSyncCLIHelper(t *testing.T) {
+	if os.Getenv("VETH_SANDO_CLI_TEST") != "1" {
+		return
+	}
+	for i, arg := range os.Args {
+		if arg == "--" {
+			os.Args = append([]string{os.Args[0]}, os.Args[i+1:]...)
+			break
+		}
+	}
+	flag.CommandLine = flag.NewFlagSet("sando-cli", flag.ContinueOnError)
+	if err := run(slog.New(slog.NewTextHandler(os.Stderr, nil))); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func TestSandoSyncDirectionOverrideCLI(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "firewall.yaml")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[{"ignorelist_id":"x","src_ip":"10.0.0.18","dst_ip":"*","protocol":6,"dst_port":443}]`))
+	}))
+	defer server.Close()
+	config := "enabled: false\nmanual_rules: manual.yaml\nsando_rules: sando.yaml\nsando_endpoint: " + server.URL + "\nsando_direction: egress\n"
+	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manual.yaml"), []byte("rules: []\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	runCLI := func(args ...string) ([]byte, error) {
+		t.Helper()
+		cmd := exec.Command(os.Args[0], append([]string{"-test.run=^TestSandoSyncCLIHelper$", "--", "--firewall-config=" + configPath}, args...)...)
+		cmd.Env = append(os.Environ(), "VETH_SANDO_CLI_TEST=1")
+		return cmd.CombinedOutput()
+	}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--sando-sync"}, "egress"},
+		{[]string{"--sando-sync", "--sando-direction=ingress"}, "ingress"},
+		{[]string{"--sando-sync", "--sando-direction=both"}, "both"},
+	} {
+		out, err := runCLI(tc.args...)
+		if err != nil {
+			t.Fatalf("sync: %s %v", out, err)
+		}
+		var file firewall.RuleFile
+		if err := yaml.Unmarshal(out, &file); err != nil || len(file.Rules) != 1 || file.Rules[0].Direction != tc.want {
+			t.Fatalf("override: %s %v", out, err)
+		}
+		saved, err := os.ReadFile(filepath.Join(dir, "sando.yaml"))
+		if err != nil || string(saved) != string(out) {
+			t.Fatalf("persisted override: %v", err)
+		}
+	}
+	before, err := os.ReadFile(filepath.Join(dir, "sando.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"--sando-sync", "--sando-direction=outbound"},
+		{"--sando-sync", "--sando-direction="},
+		{"--sando-dump", "--sando-direction=ingress"},
+		{"--sando-direction=ingress"},
+	} {
+		if out, err := runCLI(args...); err == nil || !strings.Contains(string(out), "direction") {
+			t.Fatalf("invalid override: %s %v", out, err)
+		}
+	}
+	after, err := os.ReadFile(filepath.Join(dir, "sando.yaml"))
+	if err != nil || string(before) != string(after) {
+		t.Fatal("failed override replaced policy")
+	}
+	savedConfig, err := os.ReadFile(configPath)
+	if err != nil || string(savedConfig) != config {
+		t.Fatal("override changed config defaults")
+	}
+}
 
 func TestLogScanErrorDeduplicatesFailures(t *testing.T) {
 	var output bytes.Buffer

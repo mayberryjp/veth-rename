@@ -16,14 +16,16 @@ import (
 const MaxRulesPerVeth = 256
 
 type Config struct {
-	Enabled        bool   `yaml:"enabled"`
-	AuditMode      bool   `yaml:"audit_mode"`
-	PermitAllICMP  bool   `yaml:"permit_all_icmp"`
-	ManualRules    string `yaml:"manual_rules"`
-	SandoRules     string `yaml:"sando_rules"`
-	SandoEndpoint  string `yaml:"sando_endpoint"`
-	SandoDirection string `yaml:"sando_direction"`
-	DropLog        string `yaml:"drop_log"`
+	Enabled              bool   `yaml:"enabled"`
+	AuditMode            bool   `yaml:"audit_mode"`
+	EnforcementDirection string `yaml:"enforcement_direction"`
+	PermitAllICMP        bool   `yaml:"permit_all_icmp"`
+	ManualRules          string `yaml:"manual_rules"`
+	SandoRules           string `yaml:"sando_rules"`
+	SandoEndpoint        string `yaml:"sando_endpoint"`
+	SandoDirection       string `yaml:"sando_direction"`
+	SandoAssignment      string `yaml:"sando_assignment"`
+	DropLog              string `yaml:"drop_log"`
 }
 
 type Rule struct {
@@ -118,7 +120,7 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, err
 	}
 	path = absolute
-	c := Config{PermitAllICMP: true, SandoDirection: "both"}
+	c := Config{PermitAllICMP: true, SandoDirection: "both", EnforcementDirection: "both", SandoAssignment: "endpoint"}
 	if err := readYAML(path, &c); err != nil {
 		return c, err
 	}
@@ -127,6 +129,12 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if _, err := direction(c.SandoDirection); err != nil {
 		return c, fmt.Errorf("sando_direction: %w", err)
+	}
+	if _, err := direction(c.EnforcementDirection); err != nil {
+		return c, fmt.Errorf("enforcement_direction: %w", err)
+	}
+	if c.SandoAssignment != "endpoint" && c.SandoAssignment != "all_matches" {
+		return c, fmt.Errorf("sando_assignment must be endpoint or all_matches")
 	}
 	if c.SandoEndpoint != "" {
 		u, err := url.Parse(c.SandoEndpoint)
@@ -150,6 +158,22 @@ func LoadConfig(path string) (Config, error) {
 		return c, fmt.Errorf("firewall configuration, rule files and drop_log must use distinct paths")
 	}
 	return c, nil
+}
+
+func (c Config) Enforces(hook uint8) bool {
+	if c.AuditMode {
+		return false
+	}
+	switch c.EnforcementDirection {
+	case "", "both":
+		return true
+	case "ingress":
+		return hook == 1
+	case "egress":
+		return hook == 2
+	default:
+		return false
+	}
 }
 
 func LoadPolicy(c Config) (*Policy, error) {
@@ -268,7 +292,7 @@ func (p *Policy) ForEndpoint(ipv4, ipv6 string) (*Policy, error) {
 	}
 	selected := &Policy{Config: p.Config, Rules: p.Rules}
 	for _, rule := range p.Kernel {
-		if rule.Flags&8 == 0 || relevant(rule, addresses) {
+		if rule.Flags&8 == 0 || relevant(rule, addresses, p.Config.SandoAssignment == "all_matches") {
 			selected.Kernel = append(selected.Kernel, rule)
 		}
 	}
@@ -279,7 +303,7 @@ func (p *Policy) ForEndpoint(ipv4, ipv6 string) (*Policy, error) {
 	return selected, nil
 }
 
-func relevant(rule KernelRule, addresses [2]netip.Addr) bool {
+func relevant(rule KernelRule, addresses [2]netip.Addr, allMatches bool) bool {
 	if rule.Family == 0 {
 		return true
 	}
@@ -296,6 +320,9 @@ func relevant(rule KernelRule, addresses [2]netip.Addr) bool {
 		address [16]byte
 		bits    uint8
 	}{{rule.Source, rule.SourcePrefix}, {rule.Destination, rule.DestinationPrefix}} {
+		if !allMatches && endpoint.bits == 0 {
+			continue
+		}
 		network := netip.AddrFrom16(endpoint.address)
 		unspecified := netip.IPv6Unspecified()
 		if rule.Family == 4 {
@@ -303,13 +330,16 @@ func relevant(rule KernelRule, addresses [2]netip.Addr) bool {
 			unspecified = netip.IPv4Unspecified()
 		}
 		prefix := netip.PrefixFrom(network, int(endpoint.bits))
-		if prefix.Contains(a) || prefix.Contains(unspecified) {
+		if prefix.Contains(a) || (allMatches && prefix.Contains(unspecified)) {
 			return true
 		}
 		// Docker reports the primary global IPv6 address, not automatic link-local addresses.
 		if rule.Family == 6 && prefix.Overlaps(netip.MustParsePrefix("fe80::/10")) {
 			return true
 		}
+	}
+	if !allMatches && rule.SourcePrefix == 0 && rule.DestinationPrefix == 0 {
+		return true
 	}
 	return false
 }

@@ -9,6 +9,7 @@ struct firewall_rule {
 
 const volatile __u32 firewall_enabled = 0;
 const volatile __u32 audit_mode = 0;
+const volatile __u32 enforcement_hooks = 3;
 const volatile __u32 permit_all_icmp = 1;
 
 struct firewall_table {
@@ -84,7 +85,8 @@ static __noinline int deny(struct flow_key *key, __u8 direction,
         if (count)
             *count += 1;
     }
-    return audit_mode ? -1 : 2; // TCX_NEXT in audit mode, otherwise TCX_DROP.
+    // Both hooks still evaluate policy; only selected hooks return TCX_DROP.
+    return audit_mode || !(enforcement_hooks & direction) ? -1 : 2;
 }
 
 static __noinline int address_matches(const __u8 *address, const __u8 *network,

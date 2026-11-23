@@ -101,6 +101,13 @@ func TestDropLogSyslogFormatAndEscaping(t *testing.T) {
 		strings.Count(log, "\n") != 1 {
 		t.Fatalf("syslog: %q", log)
 	}
+	if !strings.Contains(log, " TIME="+when.Format(time.RFC3339Nano)+"\n") {
+		t.Fatalf("missing unambiguous timestamp: %q", log)
+	}
+	rows, err := firewall.AnalyzeDrops(strings.NewReader(log), when, time.Hour, "packets")
+	if err != nil || len(rows) != 1 || rows[0].Packets != 1 || rows[0].Bytes != 28 || rows[0].Rule != "deny\nforged" {
+		t.Fatalf("drop log analysis round trip: %+v %v", rows, err)
+	}
 	d.Rule = 2
 	if err := writeDrop(&out, "host", Interface{}, p, d, when); err == nil {
 		t.Fatal("accepted bad rule index")
@@ -113,5 +120,22 @@ func TestDropLogSyslogFormatAndEscaping(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), ": WOULD_DROP IF=") || strings.Contains(out.String(), ": DROP ") {
 		t.Fatalf("audit verdict mislabeled: %s", out.String())
+	}
+	p.Config.AuditMode = false
+	p.Config.EnforcementDirection = "egress"
+	out.Reset()
+	if err := writeDrop(&out, "host", Interface{}, p, d, when); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), ": WOULD_DROP IF=") {
+		t.Fatalf("non-enforced ingress: %s", out.String())
+	}
+	d.Direction = 2
+	out.Reset()
+	if err := writeDrop(&out, "host", Interface{}, p, d, when); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), ": DROP IF=") {
+		t.Fatalf("enforced egress: %s", out.String())
 	}
 }

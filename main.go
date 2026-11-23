@@ -105,9 +105,30 @@ func run(log *slog.Logger) (runErr error) {
 	firewallConfig := flag.String("firewall-config", "", "firewall YAML configuration (enabled defaults to false)")
 	sandoSync := flag.Bool("sando-sync", false, "download Sando ignore list, replace generated rules, print YAML, and exit")
 	sandoDump := flag.Bool("sando-dump", false, "print saved Sando rules YAML and exit")
+	sandoDirection := flag.String("sando-direction", "", "override generated rule direction for sando-sync: ingress, egress or both")
+	propose := flag.Bool("propose-rules", false, "summarize logged firewall denies by traffic tuple and exit; does not change policy")
+	firewallLog := flag.String("firewall-log", "", "drop log to analyze (defaults to firewall-config drop_log)")
+	since := flag.String("since", "24h", "propose-rules lookback, e.g. 24h, 7d or 168h")
+	sortBy := flag.String("sort", "packets", "propose-rules ranking: packets or bytes")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments")
+	}
+	sandoDirectionSet := false
+	analysisOptionsSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "sando-direction" {
+			sandoDirectionSet = true
+		}
+		if f.Name == "firewall-log" || f.Name == "since" || f.Name == "sort" {
+			analysisOptionsSet = true
+		}
+	})
+	if analysisOptionsSet && !*propose {
+		return fmt.Errorf("firewall-log, since and sort require propose-rules")
+	}
+	if sandoDirectionSet && (!*sandoSync || *sandoDump) {
+		return fmt.Errorf("sando-direction requires sando-sync and cannot be combined with sando-dump")
 	}
 	var firewallSettings firewall.Config
 	if *firewallConfig != "" {
@@ -117,6 +138,19 @@ func run(log *slog.Logger) (runErr error) {
 			return err
 		}
 	}
+	if *propose {
+		if *sandoSync || *sandoDump || *once || *dryRun || *ipfixConfig != "" {
+			return fmt.Errorf("propose-rules cannot be combined with Sando commands, once, dry-run or ipfix-config")
+		}
+		path := *firewallLog
+		if path == "" {
+			path = firewallSettings.DropLog
+		}
+		if path == "" {
+			return fmt.Errorf("propose-rules requires firewall-log or firewall-config with drop_log")
+		}
+		return proposeRules(os.Stdout, path, *since, *sortBy, time.Now())
+	}
 	if *sandoSync || *sandoDump {
 		if *firewallConfig == "" || *once || *dryRun || *ipfixConfig != "" {
 			return fmt.Errorf("Sando commands require firewall-config and cannot be combined with once, dry-run or ipfix-config")
@@ -124,6 +158,9 @@ func run(log *slog.Logger) (runErr error) {
 		var data []byte
 		var err error
 		if *sandoSync {
+			if sandoDirectionSet {
+				firewallSettings.SandoDirection = *sandoDirection
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			data, err = firewall.Sync(ctx, firewallSettings, &http.Client{Timeout: 30 * time.Second,
@@ -203,6 +240,8 @@ func run(log *slog.Logger) (runErr error) {
 			}
 			log.Info("eBPF firewall enabled", "rules", len(firewallPolicy.Rules),
 				"audit_mode", firewallSettings.AuditMode,
+				"enforcement_direction", firewallSettings.EnforcementDirection,
+				"sando_assignment", firewallSettings.SandoAssignment,
 				"permit_all_icmp", firewallSettings.PermitAllICMP, "drop_log", firewallSettings.DropLog)
 		}
 		ticker := time.NewTicker(monitoring.PollInterval())

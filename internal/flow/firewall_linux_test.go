@@ -138,6 +138,64 @@ func verdict(t *testing.T, m *kernelMeter, program string, packet []byte, want u
 	}
 }
 
+func TestKernelFirewallEnforcementDirection(t *testing.T) {
+	rules := []firewall.Rule{{ID: "deny", Direction: "both", Action: "deny", Source: "*", Destination: "*", Protocol: "udp"}}
+	for _, tc := range []struct {
+		scope           string
+		audit           bool
+		ingress, egress uint32
+	}{
+		{"ingress", false, 2, ^uint32(0)},
+		{"egress", false, ^uint32(0), 2},
+		{"both", false, 2, 2},
+		{"ingress", true, ^uint32(0), ^uint32(0)},
+	} {
+		t.Run(fmt.Sprintf("%s-audit-%t", tc.scope, tc.audit), func(t *testing.T) {
+			m := configuredFirewallTestMeter(t, rules, firewall.Config{Enabled: true, EnforcementDirection: tc.scope, AuditMode: tc.audit}, 4, 0)
+			for _, hook := range []struct {
+				program string
+				want    uint32
+			}{{"meter", tc.ingress}, {"meter_egress", tc.egress}} {
+				for i := 0; i < 4; i++ {
+					verdict(t, m, hook.program, ipv4Packet(false, 1234), hook.want)
+				}
+				fragment := ipv4Packet(false, 1234)
+				fragment[20] = 0x20
+				verdict(t, m, hook.program, fragment, hook.want)
+				malformed := ipv4Packet(false, 1234)
+				malformed[14] = 0x40
+				verdict(t, m, hook.program, malformed, hook.want)
+			}
+			drops, err := m.ReadDrops()
+			if err != nil || len(drops) != 12 {
+				t.Fatalf("both hooks must log denies: %d %v", len(drops), err)
+			}
+			packets, err := m.Read()
+			// Samples 4 and 8 are UDP; sample 12 is malformed.
+			if err != nil || len(packets) != 2 {
+				t.Fatalf("IPFIX changed: %d %v", len(packets), err)
+			}
+		})
+	}
+}
+
+func TestKernelFirewallDirectionalShadowState(t *testing.T) {
+	rules := []firewall.Rule{{ID: "egress-allow", Direction: "egress", Action: "allow", Source: "*", Destination: "*", Protocol: "udp", DestinationPort: "443"}}
+	m := configuredFirewallTestMeter(t, rules, firewall.Config{Enabled: true, EnforcementDirection: "ingress"}, 1, 0)
+	verdict(t, m, "meter_egress", ipv4Packet(false, 1234), ^uint32(0))
+	verdict(t, m, "meter", ipv4Packet(true, 1234), ^uint32(0))
+	bypassed := ipv4Packet(false, 5678)
+	binary.BigEndian.PutUint16(bypassed[36:38], 444)
+	verdict(t, m, "meter_egress", bypassed, ^uint32(0))
+	reply := ipv4Packet(true, 5678)
+	binary.BigEndian.PutUint16(reply[34:36], 444)
+	verdict(t, m, "meter", reply, 2)
+	drops, err := m.ReadDrops()
+	if err != nil || len(drops) != 2 || drops[0].Direction != 2 || drops[1].Direction != 1 {
+		t.Fatalf("bypassed deny must not seed reply state: %+v %v", drops, err)
+	}
+}
+
 func TestKernelFirewallCaptureBeforeDropAndSampling(t *testing.T) {
 	m := firewallTestMeter(t, nil, true, 4, 0)
 	for i := 0; i < 8; i++ {

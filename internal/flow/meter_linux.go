@@ -84,8 +84,15 @@ func loadConfiguredMeter(options meterOptions) (*kernelMeter, error) {
 		spec.Maps["packets"].MaxEntries = options.ringBytes
 	}
 	enabled, permitICMP, auditMode := uint32(0), uint32(1), uint32(0)
+	enforcementHooks := uint32(3)
 	if options.firewall != nil && options.firewall.Config.Enabled {
 		enabled = 1
+		enforcementHooks = 0
+		for _, hook := range []uint8{1, 2} {
+			if options.firewall.Config.Enforces(hook) {
+				enforcementHooks |= uint32(hook)
+			}
+		}
 		if options.firewall.Config.AuditMode {
 			auditMode = 1
 		}
@@ -104,6 +111,7 @@ func loadConfiguredMeter(options meterOptions) (*kernelMeter, error) {
 	if err := spec.RewriteConstants(map[string]interface{}{
 		"sampling_rate": samplingRate, "capture_filter": options.filter, "collector": options.collector,
 		"firewall_enabled": enabled, "permit_all_icmp": permitICMP, "audit_mode": auditMode,
+		"enforcement_hooks": enforcementHooks,
 	}); err != nil {
 		return nil, fmt.Errorf("configure eBPF sampling: %w", err)
 	}

@@ -91,13 +91,13 @@ func writeDrop(out io.Writer, host string, iface Interface, policy *firewall.Pol
 		return fmt.Errorf("invalid firewall drop direction or reason")
 	}
 	action := "DROP"
-	if policy.Config.AuditMode {
+	if !policy.Config.Enforces(drop.Direction) {
 		action = "WOULD_DROP"
 	}
-	_, err := fmt.Fprintf(out, "%s %s veth-renamer[%d]: %s IF=%q DIR=%s SRC=%s DST=%s PROTO=%d SPT=%d DPT=%d LEN=%d RULE=%q REASON=%s\n",
+	_, err := fmt.Fprintf(out, "%s %s veth-renamer[%d]: %s IF=%q DIR=%s SRC=%s DST=%s PROTO=%d SPT=%d DPT=%d LEN=%d RULE=%q REASON=%s TIME=%s\n",
 		timestamp.Local().Format(time.Stamp), host, os.Getpid(), action, iface.Name, direction,
 		address(drop.Source, drop.Family), address(drop.Destination, drop.Family), drop.Protocol,
-		drop.SourcePort, drop.DestinationPort, drop.Octets, rule, reasons[drop.Reason])
+		drop.SourcePort, drop.DestinationPort, drop.Octets, rule, reasons[drop.Reason], timestamp.Format(time.RFC3339Nano))
 	return err
 }
 

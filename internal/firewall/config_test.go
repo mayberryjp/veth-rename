@@ -32,14 +32,14 @@ func TestFirewallDefaultsAndDisabledConfig(t *testing.T) {
 			t.Fatal(err)
 		}
 		c, err := LoadConfig(path)
-		if err != nil || !c.PermitAllICMP || c.AuditMode {
+		if err != nil || !c.PermitAllICMP || c.AuditMode || c.EnforcementDirection != "both" || c.SandoAssignment != "endpoint" {
 			t.Fatalf("defaults: %+v %v", c, err)
 		}
 		if content == "{}" && c.Enabled {
 			t.Fatal("firewall enabled by default")
 		}
 	}
-	for _, content := range []string{"enabled: \"false\"", "enabled: null", "enabled: true", "enabled: false\nenabled: true", "unknown: true", "permit_all_icmp: null", "audit_mode: \"true\"", "audit_mode: null", "audit_mode: 1", "[]", "enabled: false\n---\n{}"} {
+	for _, content := range []string{"enabled: \"false\"", "enabled: null", "enabled: true", "enabled: false\nenabled: true", "unknown: true", "permit_all_icmp: null", "audit_mode: \"true\"", "audit_mode: null", "audit_mode: 1", "enforcement_direction: outbound", "enforcement_direction: ''", "sando_assignment: unknown", "sando_assignment: null", "[]", "enabled: false\n---\n{}"} {
 		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -143,7 +143,7 @@ func TestSandoSyncLargePolicyPartitionsPerVeth(t *testing.T) {
 	for i := range entries {
 		entries[i] = map[string]interface{}{"ignorelist_id": fmt.Sprint(i),
 			"src_ip": fmt.Sprintf("10.0.%d.%d", i/250, i%250+1),
-			"dst_ip": "203.0.113.1", "dst_port": 443, "protocol": 6}
+			"dst_ip": "*", "dst_port": 443, "protocol": 6}
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewEncoder(w).Encode(entries); err != nil {
@@ -173,6 +173,25 @@ func TestSandoSyncLargePolicyPartitionsPerVeth(t *testing.T) {
 	}
 }
 
+func TestSandoSyncRejectsInvalidDirectionForEmptyImport(t *testing.T) {
+	c := fixture(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("[]"))
+	}))
+	defer server.Close()
+	c.SandoEndpoint = server.URL
+	for _, invalid := range []string{"", "outbound"} {
+		c.SandoDirection = invalid
+		if _, err := Sync(context.Background(), c, server.Client()); err == nil {
+			t.Fatalf("accepted direction %q for empty import", invalid)
+		}
+		saved, err := os.ReadFile(c.SandoRules)
+		if err != nil || string(saved) != "rules: []\n" {
+			t.Fatalf("invalid direction replaced saved policy: %s %v", saved, err)
+		}
+	}
+}
+
 func TestEndpointSelectionKeepsGlobalManualAndBroadRules(t *testing.T) {
 	rules := []Rule{
 		{ID: "manual", Direction: "egress", Action: "deny", Source: "10.99.0.1", Destination: "*", Protocol: "*"},
@@ -185,7 +204,7 @@ func TestEndpointSelectionKeepsGlobalManualAndBroadRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &Policy{Rules: rules, Kernel: kernel}
+	p := &Policy{Config: Config{SandoAssignment: "all_matches"}, Rules: rules, Kernel: kernel}
 	selected, err := p.ForEndpoint("10.0.0.1", "")
 	if err != nil {
 		t.Fatal(err)
@@ -203,6 +222,52 @@ func TestEndpointSelectionKeepsGlobalManualAndBroadRules(t *testing.T) {
 		if _, err := p.ForEndpoint(addresses[0], addresses[1]); err == nil {
 			t.Fatalf("accepted endpoint %v", addresses)
 		}
+	}
+}
+
+func TestEndpointAssignmentIgnoresWildcardSide(t *testing.T) {
+	rules := []Rule{
+		{ID: "source", Source: "10.0.0.18", Destination: "*"},
+		{ID: "destination", Source: "*", Destination: "10.0.0.18"},
+		{ID: "subnet", Source: "10.0.0.0/24", Destination: "*"},
+		{ID: "global", Source: "*", Destination: "*"},
+		{ID: "ipv6", Source: "*", Destination: "2001:db8:18::/64"},
+		{ID: "ipv4-any", Source: "0.0.0.0/0", Destination: "10.0.0.18"},
+		{ID: "ipv6-any", Source: "::/0", Destination: "2001:db8:18::1"},
+	}
+	for i := range rules {
+		rules[i].Direction, rules[i].Action, rules[i].Protocol, rules[i].SandoMatch = "both", "allow", "*", true
+	}
+	kernel, err := Compile(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Policy{Rules: rules, Kernel: kernel}
+	for _, tc := range []struct {
+		ip4, ip6 string
+		want     []uint32
+	}{
+		{"10.0.0.18", "2001:db8:18::1", []uint32{1, 2, 3, 4, 5, 6, 7}},
+		{"10.0.0.19", "2001:db8:19::1", []uint32{3, 4}},
+		{"10.0.1.1", "2001:db8:19::1", []uint32{4}},
+	} {
+		selected, err := p.ForEndpoint(tc.ip4, tc.ip6)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(selected.Kernel) != len(tc.want) {
+			t.Fatalf("%s/%s: %+v", tc.ip4, tc.ip6, selected.Kernel)
+		}
+		for i, r := range selected.Kernel {
+			if r.ID != tc.want[i] {
+				t.Fatalf("%s/%s: %+v", tc.ip4, tc.ip6, selected.Kernel)
+			}
+		}
+	}
+	p.Config.SandoAssignment = "all_matches"
+	selected, err := p.ForEndpoint("10.0.1.1", "2001:db8:19::1")
+	if err != nil || len(selected.Kernel) != len(rules) {
+		t.Fatalf("legacy assignment: %+v %v", selected, err)
 	}
 }
 

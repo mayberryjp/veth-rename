@@ -39,6 +39,9 @@ func constraint(data json.RawMessage, bits int) (string, error) {
 
 // Sync replaces only the generated file, after validating the complete combined policy.
 func Sync(ctx context.Context, c Config, client *http.Client) ([]byte, error) {
+	if _, err := direction(c.SandoDirection); err != nil {
+		return nil, fmt.Errorf("sando_direction: %w", err)
+	}
 	if c.ManualRules == "" || c.SandoRules == "" {
 		return nil, fmt.Errorf("manual_rules and sando_rules are required for sync")
 	}

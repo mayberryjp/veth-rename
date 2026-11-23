@@ -224,11 +224,13 @@ verified managed host-veth scope and Linux/capability requirements apply.
 ```yaml
 enabled: false
 audit_mode: false
+enforcement_direction: both
 permit_all_icmp: true
 manual_rules: manual.yaml
 sando_rules: sando.yaml
 sando_endpoint: "http://192.0.2.10:8000"
 sando_direction: both
+sando_assignment: endpoint
 drop_log: /var/log/veth-renamer/firewall-drops.log
 ```
 
@@ -238,6 +240,39 @@ ICMPv6), and `sando_direction` defaults to `both`. The three paths are required
 when enabled. Unknown/duplicate keys, nulls, aliases, invalid rules and multiple
 YAML documents are errors. Restart the daemon to load configuration or policy
 changes; a sync command never changes a running daemon's policy.
+
+### Enforce one direction, observe both
+
+`enforcement_direction` defaults to `both` and accepts `ingress`, `egress`,
+or `both`. With `enabled: true` and `audit_mode: false`:
+
+| Setting | Container -> network (ingress) | Network -> container (egress) |
+| --- | --- | --- |
+| `ingress` | Enforce policy | Permit all; log policy denies as `WOULD_DROP` |
+| `egress` | Permit all; log policy denies as `WOULD_DROP` | Enforce policy |
+| `both` | Enforce policy | Enforce policy |
+
+Both hooks always evaluate the policy and keep the same IPFIX capture,
+sampling and filtering behavior. This is not a public-Internet-only filter:
+container traffic to LAN/private IPs is also ingress. For example:
+
+```yaml
+enabled: true
+audit_mode: false
+enforcement_direction: ingress
+```
+
+The other direction remains policy-observed, including malformed/unsupported
+packet logging, but this daemon never drops it. Only policy-permitted
+TCP/UDP traffic creates state, including policy allows in the non-enforced
+direction. A packet allowed solely by directional bypass does not create
+reply state that could bypass policy in the enforced direction.
+`audit_mode: true` overrides this scope and permits both directions.
+`enabled: false` disables policy evaluation/logging altogether.
+
+This global enforcement setting is separate from individual rule `direction`
+and `sando_direction`: those decide where a rule matches, not whether the
+firewall may drop packets at a hook. Restart to change the enforcement scope.
 
 ### Audit mode (permit all, log would-be drops)
 
@@ -266,6 +301,39 @@ successful attachment and writable log as enforcement. Startup logs include
 `audit_mode` so operators can distinguish the modes. Set `audit_mode: false`
 and restart to enforce the policy; restart clears connection state, so audit
 results are a preview, not a guarantee of identical future traffic.
+
+### Analyze firewall logs (read-only)
+
+```bash
+# Default: last 24 hours, ranked by logged packet count.
+sudo veth-renamer --propose-rules --firewall-config=/etc/veth-renamer/firewall.yaml
+# Last seven days, ranked by bytes; no configuration or Docker access needed.
+sudo veth-renamer --propose-rules --firewall-log=/var/log/veth-renamer/firewall-drops.log --since=7d --sort=bytes
+```
+
+`--since` accepts positive Go durations (e.g. `12h`, `168h`) or whole days
+(`7d`, where one day is 24 hours). `--sort` accepts `packets` (default) or
+`bytes`. An explicit `--firewall-log` overrides the configured `drop_log`.
+The command prints a table and exits without loading policy files, attaching
+eBPF, changing rules, or contacting Docker/Sando. Despite its name,
+`--propose-rules` provides review evidence, not generated/applied allow rules.
+
+Rows aggregate source IP, destination IP, destination port and numeric IP
+protocol, ignoring ephemeral source ports. Interface, hook direction, verdict,
+rule ID and reason remain separate so independent rule matches and actual
+versus would-be drops are not conflated. `PACKETS` counts matching log records;
+`BYTES` sums `LEN`. ICMP's destination field is `(type << 8) | code`.
+No matching records produces only the table header. Malformed records and
+read errors fail explicitly rather than silently producing incomplete results.
+
+Only the selected file is read; rotated/archived logs are not discovered
+automatically. Counts cover logged `DROP`/`WOULD_DROP` events only, not allowed
+traffic, live kernel rule counters, or events lost to logging-buffer overflow.
+New records append an RFC3339 `TIME` with year/timezone. Older syslog-style
+records are supported using the analyzer's local timezone and current year
+(previous year for months later than the current month); their original year,
+timezone and DST ambiguity cannot be recovered. Use timestamped records for
+reliable historical analysis.
 
 ### Order, direction and state
 
@@ -335,11 +403,22 @@ rules per veth**, including its manual and imported rules. Manual matching
 preserves packet source/destination orientation.
 
 All manual rules remain global and count toward every veth. At attachment,
-Sando rules are selected when either address constraint matches the
-container endpoint's Docker-reported IPv4/IPv6 address. Selection preserves
-CIDRs, bidirectional matching, direction, ordering and original rule IDs.
-Wildcards and broad CIDRs can apply to many or all veths and count toward
-each of those veths; the limit is never implemented by truncating the policy.
+`sando_assignment` controls which imported rules are selected:
+
+- `endpoint` (new default): select when either **non-wildcard** address
+  constraint matches the container's Docker-reported IPv4/IPv6 address.
+  `.18 -> *` and `* -> .18` are assigned to `.18`'s veth, not every veth.
+  `10.4.20.0/24 -> *` is assigned to containers in that subnet.
+  `* -> *` remains global. A `/0` is treated as a wildcard for assignment.
+- `all_matches`: previous behavior, where a wildcard on either side selects
+  every veth. Set this explicitly to preserve the old assignment behavior.
+
+**Upgrade note:** the new default narrows where one-sided wildcard rules
+are installed. It does not narrow packet matching inside a selected veth:
+`*` still means any IP, including Internet/LAN destinations, and CIDRs still
+match whole subnets. Selection preserves bidirectional matching, per-rule
+direction, ordering and original rule IDs. Applicable rules count toward
+each selected veth; the limit is never implemented by truncating the policy.
 
 When Docker reports an address change, reconciliation atomically replaces
 that veth's rule table without detaching either hook or clearing TCP/UDP
@@ -351,8 +430,9 @@ veths can still be reconciled.
 
 Missing or unspecified Docker addresses retain all Sando rules for that IP
 family rather than guessing which rules are irrelevant. IPv6 link-local
-constraints and unspecified-address constraints are also retained for
-automatic addressing. Consequently an endpoint without reliable Docker
+constraints are also conservatively retained for automatic addressing;
+`all_matches` additionally retains unspecified-address constraints.
+Consequently an endpoint without reliable Docker
 address metadata may still exceed its per-veth limit. Assignment is intended
 for ordinary container endpoints, not containers routing other hosts' IPs.
 
@@ -371,6 +451,8 @@ Use HTTPS or a trusted management network; redirects are rejected.
 # Fetch, validate against manual rules, atomically replace only sando.yaml,
 # print the generated YAML, and exit. Works while firewalling is disabled.
 sudo veth-renamer --firewall-config=/etc/veth-renamer/firewall.yaml --sando-sync
+# Override sando_direction for this sync only (does not edit firewall.yaml).
+sudo veth-renamer --firewall-config=/etc/veth-renamer/firewall.yaml --sando-sync --sando-direction=ingress
 # Print the saved generated policy without contacting Sando.
 sudo veth-renamer --firewall-config=/etc/veth-renamer/firewall.yaml --sando-dump
 ```
@@ -382,6 +464,12 @@ all imported rules, not manual rules. Both rule files must exist before
 enabling the firewall; missing policy files are startup errors.
 Sync validates and saves the whole policy; the per-veth limit is checked by
 the daemon when attaching or refreshing each endpoint, not during sync.
+`--sando-direction` accepts only `ingress`, `egress`, or `both` and requires
+`--sando-sync`; it cannot be used with `--sando-dump`. It changes the direction
+written into generated rules, not the global enforcement scope. Assignment
+is done by the daemon using `sando_assignment` at attachment, since sync has
+no Docker endpoint inventory; the saved Sando file still contains all rules.
+Restart after syncing rules or changing assignment mode.
 
 ### Capture, drops and deployment
 
@@ -399,7 +487,7 @@ Drop events are independent of IPFIX sampling and written to `drop_log` in
 syslog-style human-readable lines, not JSON:
 
 ```text
-Nov 23 12:30:00 host veth-renamer[1234]: DROP IF="veth_app" DIR=ingress SRC=10.0.0.1 DST=203.0.113.1 PROTO=6 SPT=42000 DPT=80 LEN=40 RULE="default" REASON=default-deny
+Nov 23 12:30:00 host veth-renamer[1234]: DROP IF="veth_app" DIR=ingress SRC=10.0.0.1 DST=203.0.113.1 PROTO=6 SPT=42000 DPT=80 LEN=40 RULE="default" REASON=default-deny TIME=2026-11-23T12:30:00Z
 ```
 
 Each line includes packet time, interface, direction, tuple, length, matched
