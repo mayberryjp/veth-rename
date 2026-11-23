@@ -27,6 +27,10 @@ archives:
       - deploy/veth-renamer.service
       - deploy/ipfix.example.yaml
       - deploy/ipfix.conf
+      - deploy/firewall.example.yaml
+      - deploy/manual.example.yaml
+      - deploy/sando.example.yaml
+      - deploy/firewall.conf
 
 nfpms:
   - id: deb
@@ -59,6 +63,22 @@ nfpms:
           mode: 0644
       - src: deploy/ipfix.conf
         dst: /usr/share/doc/veth-renamer/ipfix.conf
+        file_info:
+          mode: 0644
+      - src: deploy/firewall.example.yaml
+        dst: /usr/share/doc/veth-renamer/firewall.example.yaml
+        file_info:
+          mode: 0644
+      - src: deploy/manual.example.yaml
+        dst: /usr/share/doc/veth-renamer/manual.example.yaml
+        file_info:
+          mode: 0644
+      - src: deploy/sando.example.yaml
+        dst: /usr/share/doc/veth-renamer/sando.example.yaml
+        file_info:
+          mode: 0644
+      - src: deploy/firewall.conf
+        dst: /usr/share/doc/veth-renamer/firewall.conf
         file_info:
           mode: 0644
     scripts:

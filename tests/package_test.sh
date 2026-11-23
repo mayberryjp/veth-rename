@@ -18,7 +18,7 @@ for package in "${packages[@]}"; do
     files=$(dpkg-deb --fsys-tarfile "$package" | tar -tf -)
     grep -qx './usr/sbin/veth-renamer' <<< "$files"
     grep -qx './usr/lib/systemd/system/veth-renamer.service' <<< "$files"
-    for example in ipfix.example.yaml ipfix.conf; do
+    for example in ipfix.example.yaml ipfix.conf firewall.example.yaml manual.example.yaml sando.example.yaml firewall.conf; do
         grep -qx "./usr/share/doc/veth-renamer/$example" <<< "$files"
         diff -u "deploy/$example" \
             <(dpkg-deb --fsys-tarfile "$package" | tar -xOf - "./usr/share/doc/veth-renamer/$example")

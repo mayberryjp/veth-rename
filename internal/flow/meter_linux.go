@@ -12,6 +12,8 @@ import (
 	"os"
 	"time"
 
+	"veth-rename/internal/firewall"
+
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
@@ -28,12 +30,16 @@ type kernelMeter struct {
 	collection *ebpf.Collection
 	links      []link.Link
 	reader     *ringbuf.Reader
+	dropReader *ringbuf.Reader
+	dropLoss   uint64
 }
 
 type meterOptions struct {
 	samplingRate, filter uint32
 	collector            Key
 	ringBytes            uint32
+	stateEntries         uint32
+	firewall             *firewall.Policy
 }
 
 func platformReady() error {
@@ -42,6 +48,14 @@ func platformReady() error {
 	}
 	// Load before changing any interfaces so verifier/capability failures are fatal.
 	m, err := loadConfiguredMeter(meterOptions{samplingRate: 1})
+	if err != nil {
+		return err
+	}
+	return m.Close()
+}
+
+func validateFirewall(p *firewall.Policy) error {
+	m, err := loadConfiguredMeter(meterOptions{samplingRate: 1, firewall: p})
 	if err != nil {
 		return err
 	}
@@ -68,8 +82,23 @@ func loadConfiguredMeter(options meterOptions) (*kernelMeter, error) {
 	if options.ringBytes != 0 {
 		spec.Maps["packets"].MaxEntries = options.ringBytes
 	}
+	enabled, permitICMP, count := uint32(0), uint32(1), uint32(0)
+	if options.firewall != nil && options.firewall.Config.Enabled {
+		enabled, count = 1, uint32(len(options.firewall.Kernel))
+		if !options.firewall.Config.PermitAllICMP {
+			permitICMP = 0
+		}
+	}
+	if enabled == 0 {
+		spec.Maps["connections"].MaxEntries = 1
+		spec.Maps["rules"].MaxEntries = 1
+		spec.Maps["drops"].MaxEntries = 4096
+	} else if options.stateEntries != 0 {
+		spec.Maps["connections"].MaxEntries = options.stateEntries
+	}
 	if err := spec.RewriteConstants(map[string]interface{}{
 		"sampling_rate": samplingRate, "capture_filter": options.filter, "collector": options.collector,
+		"firewall_enabled": enabled, "permit_all_icmp": permitICMP, "rule_count": count,
 	}); err != nil {
 		return nil, fmt.Errorf("configure eBPF sampling: %w", err)
 	}
@@ -77,12 +106,27 @@ func loadConfiguredMeter(options meterOptions) (*kernelMeter, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load eBPF meter (Linux 6.6+ and BPF/NET_ADMIN capabilities required): %w", err)
 	}
+	if enabled != 0 {
+		for i, rule := range options.firewall.Kernel {
+			if err := c.Maps["rules"].Update(uint32(i), rule, ebpf.UpdateAny); err != nil {
+				c.Close()
+				return nil, fmt.Errorf("load firewall rule %d: %w", i, err)
+			}
+		}
+	}
 	reader, err := ringbuf.NewReader(c.Maps["packets"])
 	if err != nil {
 		c.Close()
 		return nil, fmt.Errorf("open eBPF packet handoff: %w", err)
 	}
-	return &kernelMeter{collection: c, reader: reader}, nil
+	m := &kernelMeter{collection: c, reader: reader}
+	if enabled != 0 {
+		m.dropReader, err = ringbuf.NewReader(c.Maps["drops"])
+		if err != nil {
+			return nil, errors.Join(fmt.Errorf("open firewall drops: %w", err), m.Close())
+		}
+	}
+	return m, nil
 }
 
 func attachMeter(iface Interface, options meterOptions) (meter, error) {
@@ -98,8 +142,12 @@ func attachMeter(iface Interface, options meterOptions) (meter, error) {
 		return nil, err
 	}
 	for _, direction := range []ebpf.AttachType{ebpf.AttachTCXIngress, ebpf.AttachTCXEgress} {
+		program := "meter"
+		if direction == ebpf.AttachTCXEgress {
+			program = "meter_egress"
+		}
 		hook, err := link.AttachTCX(link.TCXOptions{
-			Interface: iface.Index, Program: m.collection.Programs["meter"], Attach: direction,
+			Interface: iface.Index, Program: m.collection.Programs[program], Attach: direction,
 		})
 		if err != nil {
 			return nil, errors.Join(fmt.Errorf("attach eBPF to %s: %w", iface.Name, err), m.Close())
@@ -158,7 +206,52 @@ func (m *kernelMeter) Losses() ([2]uint64, error) {
 	return result, nil
 }
 
-func (m *kernelMeter) Buffered() bool { return m.reader.AvailableBytes() > 0 }
+func (m *kernelMeter) ReadDrops() ([]Drop, error) {
+	if m.dropReader == nil {
+		return nil, nil
+	}
+	var result []Drop
+	budget := m.dropReader.AvailableBytes()
+	m.dropReader.SetDeadline(time.Now().Add(time.Millisecond))
+	until := time.Now().Add(100 * time.Millisecond)
+	var record ringbuf.Record
+	for budget > 0 && time.Now().Before(until) {
+		if err := m.dropReader.ReadInto(&record); err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				break
+			}
+			return result, fmt.Errorf("read firewall drops: %w", err)
+		}
+		budget -= (len(record.RawSample) + 8 + 7) &^ 7
+		if len(record.RawSample) != 64 {
+			return result, fmt.Errorf("unexpected firewall drop size %d", len(record.RawSample))
+		}
+		var drop Drop
+		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &drop); err != nil {
+			return result, err
+		}
+		result = append(result, drop)
+	}
+	var counts []uint64
+	if err := m.collection.Maps["drop_losses"].Lookup(uint32(0), &counts); err != nil {
+		return result, err
+	}
+	var count uint64
+	for _, n := range counts {
+		count += n
+	}
+	var lossErr error
+	if count != m.dropLoss {
+		m.dropLoss = count
+		lossErr = fmt.Errorf("firewall drop log incomplete: ring_buffer_drops_lost=%d", count)
+	}
+	_, _, gcErr := m.collection.Programs["expire_states"].Test(make([]byte, 14))
+	return result, errors.Join(lossErr, gcErr)
+}
+
+func (m *kernelMeter) Buffered() bool {
+	return m.reader.AvailableBytes() > 0 || (m.dropReader != nil && m.dropReader.AvailableBytes() > 0)
+}
 
 func (m *kernelMeter) Detach() error {
 	var errs []error
@@ -172,6 +265,9 @@ func (m *kernelMeter) Detach() error {
 func (m *kernelMeter) Close() error {
 	err := m.Detach()
 	err = errors.Join(err, m.reader.Close())
+	if m.dropReader != nil {
+		err = errors.Join(err, m.dropReader.Close())
+	}
 	m.collection.Close()
 	return err
 }

@@ -13,6 +13,8 @@ struct flow_key {
     __u8 padding;
 };
 
+#include "firewall.h"
+
 struct packet_event {
     struct flow_key key;
     __u32 octets;
@@ -56,20 +58,28 @@ static __always_inline __u16 be16(const __u8 *p) {
     return ((__u16)p[0] << 8) | p[1];
 }
 
-SEC("classifier")
-int meter(struct __sk_buff *skb) {
+static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
+    int sampled = 1;
+    struct flow_key key = {};
+    __u64 octets = 0;
     if (sampling_rate > 1) {
         __u32 index = 0;
         __u64 *sequence = bpf_map_lookup_elem(&sample_sequence, &index);
-        if (!sequence)
+        if (!sequence) {
+            if (firewall_enabled)
+                goto malformed;
             return -1;
+        }
         __u64 number = __sync_fetch_and_add(sequence, 1);
-        if ((number + 1) % sampling_rate)
-            return -1;
+        if ((number + 1) % sampling_rate) {
+            sampled = 0;
+            if (!firewall_enabled)
+                return -1;
+        }
     }
     __u8 eth[14];
     if (bpf_skb_load_bytes(skb, 0, eth, sizeof(eth)))
-        return -1;
+        goto malformed;
     __u16 type = be16(eth + 12);
     __u32 offset = 14;
 #pragma unroll
@@ -82,11 +92,14 @@ int meter(struct __sk_buff *skb) {
             offset += 4;
         }
     }
-    if (type != 0x0800 && type != 0x86dd)
+    if (type == 0x0806)
         return -1;
-    struct flow_key key = {};
+    if (type != 0x0800 && type != 0x86dd) {
+        if (firewall_enabled)
+            return deny(&key, direction, 0, 3, skb->len);
+        return -1;
+    }
     __u32 transport = 0;
-    __u64 octets = 0;
     if (type == 0x0800) {
         __u8 ip[20];
         if (bpf_skb_load_bytes(skb, offset, ip, 20))
@@ -170,6 +183,8 @@ int meter(struct __sk_buff *skb) {
             goto malformed;
         key.destination_port = be16(icmp);
     }
+    if (!sampled)
+        goto enforce;
     if ((capture_filter == 1 && key.family != 4) ||
         (capture_filter == 2 && key.family != 6) ||
         (capture_filter == 3 && key.protocol != 6) ||
@@ -177,7 +192,7 @@ int meter(struct __sk_buff *skb) {
         (capture_filter == 5 && !(key.family == 4 && key.protocol == 1)) ||
         (capture_filter == 6 && !(key.family == 6 && key.protocol == 58))) {
         loss(3);
-        return -1;
+        goto enforce;
     }
     if (key.protocol == 17 && key.family == collector.family &&
         key.destination_port == collector.destination_port) {
@@ -189,13 +204,13 @@ int meter(struct __sk_buff *skb) {
         }
         if (matches) {
             loss(4);
-            return -1;
+            goto enforce;
         }
     }
     struct packet_event *event = bpf_ringbuf_reserve(&packets, sizeof(*event), 0);
     if (!event) {
         loss(0);
-        return -1;
+        goto enforce;
     }
     event->key = key;
     event->octets = octets;
@@ -203,13 +218,30 @@ int meter(struct __sk_buff *skb) {
     __builtin_memset(event->padding, 0, 3);
     event->time = bpf_ktime_get_ns();
     bpf_ringbuf_submit(event, 0);
-    return -1;
+enforce:
+    return firewall(&key, direction, tcp_flags, octets);
 malformed:
-    loss(1);
+    if (sampled)
+        loss(1);
+    if (firewall_enabled)
+        return deny(&key, direction, 0, 2, skb->len);
     return -1;
 excluded:
-    loss(2);
+    if (sampled)
+        loss(2);
+    if (firewall_enabled)
+        return deny(&key, direction, 0, 3, octets);
     return -1;
+}
+
+SEC("classifier")
+int meter(struct __sk_buff *skb) {
+    return process(skb, 1);
+}
+
+SEC("classifier")
+int meter_egress(struct __sk_buff *skb) {
+    return process(skb, 2);
 }
 
 char LICENSE[] SEC("license") = "GPL";

@@ -19,7 +19,7 @@ endpoint validation is not a license to attach a traffic monitor.
 Requires Linux **6.6+** with TCX/eBPF support (Ubuntu 24.04's 6.8 kernel on
 amd64 is supported), and `CAP_BPF`, `CAP_PERFMON` and `CAP_NET_ADMIN`
 (the daemon already requires additional capabilities for renaming).
-Monitoring uses read-only packet observation at both host-veth TCX ingress
+Without firewalling, monitoring uses read-only packet observation at both host-veth TCX ingress
 and egress. It does not replace existing classifiers, change qdiscs, modify
 packets, or lower links. Hooks follow ifindexes across primary renames and
 are closed on endpoint removal or shutdown. Packets before initial attachment
@@ -211,6 +211,168 @@ unidirectional IPFIX schema; three additional standard IEs retain per-veth
 identity and end reason. Records are 77 bytes (IPv4) or 101 bytes (IPv6),
 not the reference schema's 52/76 bytes. Collectors must decode templates,
 not hard-code record widths.
+
+## Optional eBPF firewall and Sando ignore-list import
+
+Firewalling is **disabled by default**. Add
+`--firewall-config=/etc/veth-renamer/firewall.yaml` alongside `--ipfix-config`.
+Only `enabled: true` activates enforcement; an omitted or false `enabled`
+leaves the exporter observational and does not open the drop log or load rules.
+Enabled firewalling requires daemon mode and IPFIX configuration. The same
+verified managed host-veth scope and Linux/capability requirements apply.
+
+```yaml
+enabled: false
+permit_all_icmp: true
+manual_rules: manual.yaml
+sando_rules: sando.yaml
+sando_endpoint: "http://192.0.2.10:8000"
+sando_direction: both
+drop_log: /var/log/veth-renamer/firewall-drops.log
+```
+
+Rule/log paths are relative to this configuration file unless absolute.
+`enabled` defaults to false, `permit_all_icmp` defaults to true (IPv4 ICMP and
+ICMPv6), and `sando_direction` defaults to `both`. The three paths are required
+when enabled. Unknown/duplicate keys, nulls, aliases, invalid rules and multiple
+YAML documents are errors. Restart the daemon to load configuration or policy
+changes; a sync command never changes a running daemon's policy.
+
+### Order, direction and state
+
+The firewall evaluates **every packet**, independent of IPFIX sampling or
+capture filters:
+
+1. ARP for link reachability, then valid ICMP/ICMPv6 if `permit_all_icmp`.
+2. Existing permitted TCP/UDP flow state and its replies.
+3. Manual rules in file order, first match wins.
+4. Imported Sando allow rules in file order.
+5. Default deny.
+
+Directions are **host-veth-relative**: `ingress` is container -> network;
+`egress` is network -> container; `both` matches either hook. Directions apply
+to each manual rule and to imported rules via `sando_direction` at sync time.
+System allowances precede manual denies: to control ICMP manually, set
+`permit_all_icmp: false`. State is per veth and keyed by addresses, ports,
+protocol, IP family and hook direction, not TOS. UDP state is created by an
+allowed datagram. TCP reply state requires an allowed SYN, a reverse SYN/ACK
+and a forward ACK before ordinary reverse data is allowed; explicit policy
+can still allow packets independently of state.
+
+Idle state expires after 5 minutes for TCP and 30 seconds for UDP. TCP FIN
+reduces the idle timeout to 30 seconds; RST invalidates state. Polling reclaims
+expired entries. The non-LRU state table holds 65,536 entries per veth;
+packets requiring new state are dropped and logged if it is full. Established
+entries are not evicted to make room. This is bounded tuple/handshake tracking,
+not full Linux conntrack: it does not validate TCP sequence windows, perform
+NAT, or recognize related ICMP errors when the global ICMP allowance is off.
+State is lost on detach, interface replacement or process restart.
+DHCP, other broadcast traffic and multicast are not automatically allowed;
+add explicit rules where needed. Reply state requires the exact reversed
+tuple and does not associate a broadcast request with a unicast reply.
+
+### Manual and imported rules
+
+Both files contain a `rules` list; initialize each with `rules: []`.
+For example, a manual file:
+
+```yaml
+rules:
+  - id: block-container-dns
+    direction: ingress
+    action: deny
+    source: "*"
+    destination: "*"
+    protocol: udp
+    destination_port: "53"
+  - id: allow-container-https
+    direction: ingress
+    action: allow
+    source: "10.0.0.0/24"
+    destination: "*"
+    protocol: tcp
+    destination_port: "443"
+```
+
+`id`, `direction`, `action`, `source`, `destination`, and `protocol` are
+required. Addresses accept literal IPv4/IPv6, CIDRs, or `"*"`. Protocols accept
+`tcp`, `udp`, `icmp`, `icmp6`, `sctp`, a decimal number 0..255, or `"*"`.
+Optional `source_port` / `destination_port` accept decimal 0..65535 or `"*"`;
+omission means unconstrained. Zero remains a literal constraint. ICMP uses
+the exporter's zero source port and `(type << 8) | code` destination field,
+not transport ports. Rules must have unique IDs across both files, and the
+combined limit is 256. Manual matching preserves packet source/destination
+orientation.
+
+Sando sync uses [mayberryjp/sando's ignore-list API](https://github.com/mayberryjp/sando/blob/main/src/routers/ignorelist.py):
+`GET <sando_endpoint>/api/ignorelist`. It accepts the JSON array of
+`ignorelist_id`, `src_ip`, `dst_ip`, `dst_port`, and `protocol`, including
+numeric strings and `"*"` constraints. IDs are prefixed with `sando:`.
+Generated rules are allow-only with `sando_match: true`, preserving Sando's
+bidirectional address matching and port matching against **either** endpoint,
+within the configured hook direction. Manual rules cannot use `sando_match`.
+Sando's `added` metadata is ignored. The currently published API has no
+authentication requirement; this client does not implement credentials.
+Use HTTPS or a trusted management network; redirects are rejected.
+
+```bash
+# Fetch, validate against manual rules, atomically replace only sando.yaml,
+# print the generated YAML, and exit. Works while firewalling is disabled.
+sudo veth-renamer --firewall-config=/etc/veth-renamer/firewall.yaml --sando-sync
+# Print the saved generated policy without contacting Sando.
+sudo veth-renamer --firewall-config=/etc/veth-renamer/firewall.yaml --sando-dump
+```
+
+Sync is explicit only: no startup or periodic downloads. HTTP errors, invalid
+responses, duplicate IDs, oversized policies and file-write failures exit
+nonzero and preserve the last saved policy. A successful empty list removes
+all imported rules, not manual rules. Both rule files must exist before
+enabling the firewall; missing policy files are startup errors.
+
+### Capture, drops and deployment
+
+The same hook submits eligible IPFIX metadata **before** returning a firewall
+drop, so denied flows remain visible. Existing IPFIX sampling, capture filters,
+fragment exclusions, collector exclusions and bounded-buffer losses still
+apply; use `sampling_rate: 1` and `capture_filter: ""` for fullest visibility.
+Excluded fragments and malformed/unsupported packets are denied and logged,
+but are not guessed into IPFIX flows. Non-IP frames other than ARP are denied.
+A full IPFIX buffer never bypasses firewall enforcement. This order applies
+within this daemon's hook; it cannot observe packets dropped by an earlier
+external classifier.
+
+Drop events are independent of IPFIX sampling and written to `drop_log` in
+syslog-style human-readable lines, not JSON:
+
+```text
+Nov 23 12:30:00 host veth-renamer[1234]: DROP IF="veth_app" DIR=ingress SRC=10.0.0.1 DST=203.0.113.1 PROTO=6 SPT=42000 DPT=80 LEN=40 RULE="default" REASON=default-deny
+```
+
+Each line includes packet time, interface, direction, tuple, length, matched
+rule and reason. Rule/interface strings are escaped to prevent multiline
+records. Logs use a separate 1 MiB ring per veth; overflow and write failures
+are explicit daemon errors, never permission to pass traffic. The daemon
+opens the log in append mode (new files 0600). Use external rotation with
+`copytruncate`, or restart after rename-based rotation. Parent directories
+must exist; the supplied systemd drop-in creates the default log directory.
+
+Install the four supplied firewall examples from `/usr/share/doc/veth-renamer/`
+(or `deploy/` for source installs): `firewall.example.yaml` as
+`/etc/veth-renamer/firewall.yaml`, `manual.example.yaml` as `manual.yaml`,
+`sando.example.yaml` as `sando.yaml`, and `firewall.conf` as
+`/etc/systemd/system/veth-renamer.service.d/firewall.conf`. **Replace/remove the
+previous `ipfix.conf` drop-in** rather than having competing `ExecStart`
+overrides. Set your collector and Sando endpoint, sync and inspect the policy,
+then explicitly set `enabled: true`, run `systemctl daemon-reload`, and restart.
+Preserve custom naming flags. For a custom log directory, also configure
+systemd `ReadWritePaths`; the base unit uses `ProtectSystem=strict`.
+
+Enforcement begins only after successful attachment. Discovery/attachment
+gaps, daemon downtime and shutdown detach leave traffic unprotected; this
+feature is not a fail-closed container lifecycle controller. Attachment
+failures are explicit errors and are retried. Verifier/rule/log-open failures
+abort startup before reconciliation. Keep an independent host firewall if
+protection must survive daemon failure.
 
 ## Controlled primary-name repair
 

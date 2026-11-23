@@ -1,0 +1,9 @@
+# Firewalling is opt-in; omitted enabled also defaults to false.
+enabled: false
+permit_all_icmp: true
+manual_rules: manual.yaml
+sando_rules: sando.yaml
+# Base URL: sync requests GET /api/ignorelist. Set your actual Sando host/port.
+sando_endpoint: "http://192.0.2.10:8000"
+sando_direction: both
+drop_log: /var/log/veth-renamer/firewall-drops.log

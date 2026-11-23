@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"veth-rename/internal/firewall"
 	"veth-rename/internal/flow"
 )
 
@@ -100,9 +102,54 @@ func run(log *slog.Logger) (runErr error) {
 	once := flag.Bool("once", false, "reconcile once, print JSON, then exit (nonzero on errors)")
 	dryRun := flag.Bool("dry-run", false, "inspect and plan without modifying interfaces")
 	ipfixConfig := flag.String("ipfix-config", "", "opt-in eBPF/IPFIX YAML configuration file (daemon mode only)")
+	firewallConfig := flag.String("firewall-config", "", "firewall YAML configuration (enabled defaults to false)")
+	sandoSync := flag.Bool("sando-sync", false, "download Sando ignore list, replace generated rules, print YAML, and exit")
+	sandoDump := flag.Bool("sando-dump", false, "print saved Sando rules YAML and exit")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments")
+	}
+	var firewallSettings firewall.Config
+	if *firewallConfig != "" {
+		var err error
+		firewallSettings, err = firewall.LoadConfig(*firewallConfig)
+		if err != nil {
+			return err
+		}
+	}
+	if *sandoSync || *sandoDump {
+		if *firewallConfig == "" || *once || *dryRun || *ipfixConfig != "" {
+			return fmt.Errorf("Sando commands require firewall-config and cannot be combined with once, dry-run or ipfix-config")
+		}
+		var data []byte
+		var err error
+		if *sandoSync {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			data, err = firewall.Sync(ctx, firewallSettings, &http.Client{Timeout: 30 * time.Second,
+				CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }})
+		} else {
+			if firewallSettings.SandoRules == "" {
+				return fmt.Errorf("sando_rules is required for dump")
+			}
+			data, err = os.ReadFile(firewallSettings.SandoRules)
+		}
+		if err != nil {
+			return err
+		}
+		_, err = os.Stdout.Write(data)
+		return err
+	}
+	var firewallPolicy *firewall.Policy
+	if firewallSettings.Enabled {
+		if *ipfixConfig == "" || *once || *dryRun {
+			return fmt.Errorf("enabled firewall requires ipfix-config in daemon mode")
+		}
+		var err error
+		firewallPolicy, err = firewall.LoadPolicy(firewallSettings)
+		if err != nil {
+			return err
+		}
 	}
 	if *mode != "primary-repair" && *mode != "auto" && *mode != "primary" && *mode != "alternative" {
 		return fmt.Errorf("mode must be primary-repair, auto, primary or alternative")
@@ -150,6 +197,13 @@ func run(log *slog.Logger) (runErr error) {
 			return err
 		}
 		defer func() { runErr = errors.Join(runErr, monitoring.Close()) }()
+		if firewallPolicy != nil {
+			if err := monitoring.EnableFirewall(firewallPolicy); err != nil {
+				return err
+			}
+			log.Info("eBPF firewall enabled", "rules", len(firewallPolicy.Rules),
+				"permit_all_icmp", firewallSettings.PermitAllICMP, "drop_log", firewallSettings.DropLog)
+		}
 		ticker := time.NewTicker(monitoring.PollInterval())
 		defer ticker.Stop()
 		flowTicks = ticker.C

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sort"
 	"time"
 )
@@ -42,6 +43,8 @@ type Service struct {
 	retryDelay  time.Duration
 	nextRetry   time.Time
 	exportError error
+	dropLog     *os.File
+	logHost     string
 }
 
 type udpWriter struct {
@@ -164,6 +167,7 @@ func (s *Service) expireDue(o *observed, mono uint64, forced uint8, deadline tim
 }
 
 func (s *Service) ingest(o *observed, deadline time.Time) error {
+	dropErr := s.logDrops(o)
 	packets, readErr := o.meter.Read()
 	droppedBefore := o.dropped
 	for _, p := range packets {
@@ -195,7 +199,7 @@ func (s *Service) ingest(o *observed, deadline time.Time) error {
 	if o.dropped != droppedBefore {
 		capacityErr = fmt.Errorf("metering loss on %s: pending export queue full; rejected_packets=%d; exports are incomplete", o.iface.Name, o.dropped)
 	}
-	return errors.Join(readErr, err, lossErr, capacityErr)
+	return errors.Join(readErr, err, lossErr, capacityErr, dropErr)
 }
 
 func (s *Service) failExport(err error) error {
@@ -351,6 +355,10 @@ func (s *Service) Close() error {
 	if s.writer != nil && s.writer.conn != nil {
 		errs = append(errs, s.writer.conn.Close())
 		s.writer.conn = nil
+	}
+	if s.dropLog != nil {
+		errs = append(errs, s.dropLog.Sync(), s.dropLog.Close())
+		s.dropLog = nil
 	}
 	return errors.Join(errs...)
 }
