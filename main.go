@@ -304,11 +304,40 @@ func run(log *slog.Logger) (runErr error) {
 	scan()
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
+	var sandoResults <-chan sandoResult
+	if firewallSettings.SandoPoll {
+		pollInterval, err := time.ParseDuration(firewallSettings.SandoPollInterval)
+		if err != nil {
+			return err
+		}
+		var stop func()
+		sandoResults, stop = startSandoPolling(ctx, firewallSettings, &http.Client{Timeout: 30 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, pollInterval)
+		defer stop()
+		log.Info("Sando policy polling enabled", "interval", pollInterval.String())
+	}
 	var previousFlowError error
+	var previousSandoError error
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case result := <-sandoResults:
+			err := result.err
+			if err == nil {
+				var updated int
+				updated, err = monitoring.ReloadFirewall(result.update.Policy, result.update.Save)
+				if updated > 0 {
+					log.Info("Sando policy applied", "updated_veths", updated)
+				}
+			}
+			if err != nil && (previousSandoError == nil || err.Error() != previousSandoError.Error()) {
+				log.Error("Sando policy update failed; daemon will retry", "error", err)
+			} else if err == nil && previousSandoError != nil {
+				log.Info("Sando policy polling recovered")
+			}
+			previousSandoError = err
+			continue
 		case <-flowTicks:
 			err := monitoring.Poll()
 			if err != nil && (previousFlowError == nil || err.Error() != previousFlowError.Error()) {

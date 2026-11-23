@@ -14,7 +14,7 @@ const volatile __u32 permit_all_icmp = 1;
 
 struct firewall_table {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 256);
+    __uint(max_entries, 257);
     __type(key, __u32);
     __type(value, struct firewall_rule);
 };
@@ -36,6 +36,7 @@ struct state_value {
     struct bpf_spin_lock lock;
     __u32 stage;
     __u64 last;
+    __u32 generation, padding;
 };
 
 // Not LRU: a full table must not evict established connections silently.
@@ -52,7 +53,8 @@ struct drop_event {
     __u32 rule;
     __u32 octets;
     __u8 direction, reason;
-    __u8 padding[6];
+    __u8 padding[2];
+    __u32 generation;
 };
 
 struct {
@@ -67,8 +69,8 @@ struct {
     __type(value, __u64);
 } drop_losses SEC(".maps");
 
-static __noinline int deny(struct flow_key *key, __u8 direction,
-                                __u32 rule, __u8 reason, __u32 octets) {
+static __always_inline int deny(struct flow_key *key, __u8 direction,
+                                __u32 rule, __u8 reason, __u32 octets, __u32 generation) {
     struct drop_event *event = bpf_ringbuf_reserve(&drops, sizeof(*event), 0);
     if (event) {
         event->key = *key;
@@ -76,6 +78,7 @@ static __noinline int deny(struct flow_key *key, __u8 direction,
         event->rule = rule;
         event->octets = octets;
         event->direction = direction;
+        event->generation = generation;
         event->reason = reason;
         __builtin_memset(event->padding, 0, sizeof(event->padding));
         bpf_ringbuf_submit(event, 0);
@@ -143,7 +146,7 @@ static __always_inline void state_key(struct flow_key *out, struct flow_key *key
 }
 
 static __noinline int established(struct flow_key *key, __u8 direction,
-                                       __u8 flags, __u64 now) {
+                                       __u8 flags, __u64 now, __u32 generation) {
     if (key->protocol != 6 && key->protocol != 17)
         return 0;
     struct flow_key lookup;
@@ -160,7 +163,9 @@ static __noinline int established(struct flow_key *key, __u8 direction,
     int allow = 0;
     bpf_spin_lock(&state->lock);
     __u64 timeout = key->protocol == 17 || state->stage == 4 ? 30000000000ULL : 300000000000ULL;
-    if (!state->stage || state->stage == 5 || now - state->last > timeout) {
+    if (state->generation != generation) {
+        // An old in-flight packet must not invalidate state from a newer table.
+    } else if (!state->stage || state->stage == 5 || now - state->last > timeout) {
         if (state->stage != 5)
             state->stage = 0;
     } else if (key->protocol == 17) {
@@ -190,12 +195,12 @@ static __noinline int established(struct flow_key *key, __u8 direction,
 }
 
 static __noinline int remember(struct flow_key *key, __u8 direction,
-                                    __u8 flags, __u64 now) {
+                                    __u8 flags, __u64 now, __u32 generation) {
     if (key->protocol != 17 && !(key->protocol == 6 && (flags & 0x17) == 2))
         return 0;
     struct flow_key lookup;
     state_key(&lookup, key, direction, 0);
-    struct state_value value = {.stage = 1, .last = now};
+    struct state_value value = {.stage = 1, .last = now, .generation = generation};
     long result = bpf_map_update_elem(&connections, &lookup, &value, BPF_NOEXIST);
     if (result == -17) {
         struct state_value *existing = bpf_map_lookup_elem(&connections, &lookup);
@@ -203,12 +208,13 @@ static __noinline int remember(struct flow_key *key, __u8 direction,
             return 1;
         int retiring = 0;
         bpf_spin_lock(&existing->lock);
-        if (existing->stage == 5) {
+        if (existing->stage == 5 || existing->generation > generation) {
             retiring = 1;
         } else {
-            if (!existing->stage || existing->stage >= 3)
+            if (existing->generation != generation || !existing->stage || existing->stage >= 3)
                 existing->stage = 1;
             existing->last = now;
+            existing->generation = generation;
         }
         bpf_spin_unlock(&existing->lock);
         return retiring;
@@ -244,33 +250,43 @@ static __noinline int firewall(struct flow_key *key, __u8 direction,
                            (key->family == 6 && key->protocol == 58)))
         return -1;
     __u64 now = bpf_ktime_get_ns();
-    if (established(key, direction, flags, now))
-        return -1;
     struct rule_context context = {.key = *key, .direction = direction};
     __u32 slot = 0;
     // Snapshot one immutable table for the entire packet, including callback iterations.
     context.table = bpf_map_lookup_elem(&rules, &slot);
     if (!context.table)
-        return deny(key, direction, 0, 5, octets);
+        return deny(key, direction, 0, 5, octets, 0);
+    __u32 metadata = 256;
+    struct firewall_rule *version = bpf_map_lookup_elem(context.table, &metadata);
+    if (!version)
+        return deny(key, direction, 0, 5, octets, 0);
+    __u32 generation = version->id;
+    if (established(key, direction, flags, now, generation))
+        return -1;
     bpf_loop(256, find_rule, &context, 0);
     if (context.matched) {
         if (!context.action)
-            return deny(key, direction, context.matched, 1, octets);
-        if (remember(key, direction, flags, now))
-            return deny(key, direction, context.matched, 4, octets);
+            return deny(key, direction, context.matched, 1, octets, generation);
+        if (remember(key, direction, flags, now, generation))
+            return deny(key, direction, context.matched, 4, octets, generation);
         return -1;
     }
-    return deny(key, direction, 0, 0, octets);
+    return deny(key, direction, 0, 0, octets, generation);
 }
+
+struct expiry_context {
+    __u64 now;
+    __u32 generation;
+};
 
 static long expire_connection(void *map, const void *key, void *value, void *context) {
     struct state_value *state = value;
     const struct flow_key *flow = key;
-    __u64 now = *(__u64 *)context;
+    struct expiry_context *expiry = context;
     int expired = 0;
     bpf_spin_lock(&state->lock);
     __u64 timeout = flow->protocol == 17 || state->stage == 4 ? 30000000000ULL : 300000000000ULL;
-    if (!state->stage || state->stage == 5 || now - state->last > timeout) {
+    if (state->generation != expiry->generation || !state->stage || state->stage == 5 || expiry->now - state->last > timeout) {
         // Claim the entry before deletion; packet handlers cannot refresh it.
         state->stage = 5;
         expired = 1;
@@ -283,7 +299,14 @@ static long expire_connection(void *map, const void *key, void *value, void *con
 
 SEC("classifier")
 int expire_states(struct __sk_buff *skb) {
-    __u64 now = bpf_ktime_get_ns();
-    bpf_for_each_map_elem(&connections, expire_connection, &now, 0);
+    __u32 slot = 0, metadata = 256;
+    void *table = bpf_map_lookup_elem(&rules, &slot);
+    if (!table)
+        return 0;
+    struct firewall_rule *version = bpf_map_lookup_elem(table, &metadata);
+    if (!version)
+        return 0;
+    struct expiry_context expiry = {.now = bpf_ktime_get_ns(), .generation = version->id};
+    bpf_for_each_map_elem(&connections, expire_connection, &expiry, 0);
     return 0;
 }

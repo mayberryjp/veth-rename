@@ -1,6 +1,7 @@
 package firewall
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,45 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+type SandoUpdate struct {
+	Policy *Policy
+	data   []byte
+}
+
+func (u *SandoUpdate) Save() error {
+	current, err := os.ReadFile(u.Policy.Config.SandoRules)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if bytes.Equal(current, u.data) {
+		return nil
+	}
+	return atomicWrite(u.Policy.Config.SandoRules, u.data)
+}
+
+// SandoPoller is used by a single fetch worker. Cached updates are returned on
+// 304 so a failed save or live application can be retried without a new download.
+type SandoPoller struct {
+	Config Config
+	Client *http.Client
+	etag   string
+	cached *SandoUpdate
+}
+
+func (p *SandoPoller) Poll(ctx context.Context) (*SandoUpdate, error) {
+	update, etag, err := fetchSando(ctx, p.Config, p.Client, p.etag)
+	if err != nil {
+		return nil, err
+	}
+	if update != nil {
+		p.cached, p.etag = update, etag
+	}
+	if p.cached == nil {
+		return nil, fmt.Errorf("Sando returned 304 without a cached policy")
+	}
+	return p.cached, nil
+}
 
 type sandoEntry struct {
 	ID          string          `json:"ignorelist_id"`
@@ -39,80 +79,99 @@ func constraint(data json.RawMessage, bits int) (string, error) {
 
 // Sync replaces only the generated file, after validating the complete combined policy.
 func Sync(ctx context.Context, c Config, client *http.Client) ([]byte, error) {
-	if _, err := direction(c.SandoDirection); err != nil {
-		return nil, fmt.Errorf("sando_direction: %w", err)
-	}
-	if c.ManualRules == "" || c.SandoRules == "" {
-		return nil, fmt.Errorf("manual_rules and sando_rules are required for sync")
-	}
-	if c.SandoEndpoint == "" {
-		return nil, fmt.Errorf("sando_endpoint is required for sync")
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.SandoEndpoint, "/")+"/api/ignorelist", nil)
+	update, _, err := fetchSando(ctx, c, client, "")
 	if err != nil {
 		return nil, err
 	}
+	if update == nil {
+		return nil, fmt.Errorf("Sando returned 304 for an unconditional sync")
+	}
+	if err := update.Save(); err != nil {
+		return nil, err
+	}
+	return update.data, nil
+}
+
+func fetchSando(ctx context.Context, c Config, client *http.Client, etag string) (*SandoUpdate, string, error) {
+	if _, err := direction(c.SandoDirection); err != nil {
+		return nil, "", fmt.Errorf("sando_direction: %w", err)
+	}
+	if c.ManualRules == "" || c.SandoRules == "" {
+		return nil, "", fmt.Errorf("manual_rules and sando_rules are required for sync")
+	}
+	if c.SandoEndpoint == "" {
+		return nil, "", fmt.Errorf("sando_endpoint is required for sync")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.SandoEndpoint, "/")+"/api/ignorelist", nil)
+	if err != nil {
+		return nil, "", err
+	}
 	req.Header.Set("Accept", "application/json")
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
 	response, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch Sando ignore list: %w", err)
+		return nil, "", fmt.Errorf("fetch Sando ignore list: %w", err)
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotModified && etag != "" {
+		return nil, etag, nil
+	}
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Sando ignore list returned HTTP %d", response.StatusCode)
+		return nil, "", fmt.Errorf("Sando ignore list returned HTTP %d", response.StatusCode)
 	}
 	const limit = 4 << 20
 	data, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(data) > limit {
-		return nil, fmt.Errorf("Sando response exceeds 4 MiB")
+		return nil, "", fmt.Errorf("Sando response exceeds 4 MiB")
 	}
 	if !strings.HasPrefix(strings.TrimSpace(string(data)), "[") {
-		return nil, fmt.Errorf("Sando ignore list must be a JSON array")
+		return nil, "", fmt.Errorf("Sando ignore list must be a JSON array")
 	}
 	var entries []sandoEntry
 	if err := json.Unmarshal(data, &entries); err != nil {
-		return nil, fmt.Errorf("decode Sando ignore list: %w", err)
+		return nil, "", fmt.Errorf("decode Sando ignore list: %w", err)
 	}
 	file := RuleFile{Rules: make([]Rule, 0, len(entries))}
 	for _, entry := range entries {
 		port, err := constraint(entry.Port, 16)
 		if err != nil {
-			return nil, fmt.Errorf("Sando rule %q dst_port: %w", entry.ID, err)
+			return nil, "", fmt.Errorf("Sando rule %q dst_port: %w", entry.ID, err)
 		}
 		protocol, err := constraint(entry.Protocol, 8)
 		if err != nil {
-			return nil, fmt.Errorf("Sando rule %q protocol: %w", entry.ID, err)
+			return nil, "", fmt.Errorf("Sando rule %q protocol: %w", entry.ID, err)
 		}
 		file.Rules = append(file.Rules, Rule{ID: "sando:" + entry.ID, Direction: c.SandoDirection,
 			Action: "allow", Source: entry.Source, Destination: entry.Destination,
 			Protocol: protocol, DestinationPort: port, SandoMatch: true})
 		if entry.ID == "" {
-			return nil, fmt.Errorf("Sando rule has empty ignorelist_id")
+			return nil, "", fmt.Errorf("Sando rule has empty ignorelist_id")
 		}
 	}
 	var manual RuleFile
 	if err := readYAML(c.ManualRules, &manual); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	for _, r := range manual.Rules {
 		if r.SandoMatch {
-			return nil, fmt.Errorf("manual rules cannot use sando_match")
+			return nil, "", fmt.Errorf("manual rules cannot use sando_match")
 		}
 	}
-	if _, err := Compile(append(manual.Rules, file.Rules...)); err != nil {
-		return nil, err
+	policy := &Policy{Config: c, Rules: append(manual.Rules, file.Rules...)}
+	policy.Kernel, err = Compile(policy.Rules)
+	if err != nil {
+		return nil, "", err
 	}
 	out, err := yaml.Marshal(file)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	if err := atomicWrite(c.SandoRules, out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return &SandoUpdate{Policy: policy, data: out}, response.Header.Get("ETag"), nil
 }
 
 func atomicWrite(path string, data []byte) error {

@@ -96,7 +96,7 @@ static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
         return -1;
     if (type != 0x0800 && type != 0x86dd) {
         if (firewall_enabled)
-            return deny(&key, direction, 0, 3, skb->len);
+            return deny(&key, direction, 0, 3, skb->len, 0);
         return -1;
     }
     __u32 transport = 0;
@@ -224,13 +224,13 @@ malformed:
     if (sampled)
         loss(1);
     if (firewall_enabled)
-        return deny(&key, direction, 0, 2, skb->len);
+        return deny(&key, direction, 0, 2, skb->len, 0);
     return -1;
 excluded:
     if (sampled)
         loss(2);
     if (firewall_enabled)
-        return deny(&key, direction, 0, 3, octets);
+        return deny(&key, direction, 0, 3, octets, 0);
     return -1;
 }
 

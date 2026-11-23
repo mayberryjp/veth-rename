@@ -391,6 +391,53 @@ func TestKernelFirewallConcurrentRuleReplacement(t *testing.T) {
 	}
 }
 
+func TestKernelFirewallReloadRevokesOnlyChangedVethState(t *testing.T) {
+	for _, protocol := range []string{"udp", "tcp"} {
+		t.Run(protocol, func(t *testing.T) {
+			rules := []firewall.Rule{{ID: "allow", Direction: "ingress", Action: "allow", Source: "*", Destination: "*", Protocol: protocol}}
+			changed := firewallTestMeter(t, rules, true, 1, 0)
+			unchanged := firewallTestMeter(t, rules, true, 1, 0)
+			forward, reply := ipv4Packet(false, 1234), ipv4Packet(true, 1234)
+			if protocol == "tcp" {
+				forward, reply = transportPacket(false, 6), transportPacket(true, 6)
+			}
+			for _, m := range []*kernelMeter{changed, unchanged} {
+				if protocol == "tcp" {
+					forward[47], reply[47] = 2, 0x12
+					verdict(t, m, "meter", forward, ^uint32(0))
+					verdict(t, m, "meter_egress", reply, ^uint32(0))
+					forward[47], reply[47] = 0x10, 0x10
+				}
+				verdict(t, m, "meter", forward, ^uint32(0))
+				verdict(t, m, "meter_egress", reply, ^uint32(0))
+			}
+			if err := changed.UpdateFirewall(&firewall.Policy{Generation: 2}); err != nil {
+				t.Fatal(err)
+			}
+			verdict(t, changed, "meter", forward, 2)
+			verdict(t, changed, "meter_egress", reply, 2)
+			verdict(t, unchanged, "meter_egress", reply, ^uint32(0))
+			drops, err := changed.ReadDrops()
+			if err != nil || len(drops) != 2 || drops[0].Generation != 2 {
+				t.Fatalf("reload events: %+v %v", drops, err)
+			}
+			// Restoring the allow must create state in the new generation.
+			kernel, err := firewall.Compile(rules)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := changed.UpdateFirewall(&firewall.Policy{Generation: 3, Kernel: kernel}); err != nil {
+				t.Fatal(err)
+			}
+			if protocol == "tcp" {
+				forward[47], reply[47] = 2, 0x12
+			}
+			verdict(t, changed, "meter", forward, ^uint32(0))
+			verdict(t, changed, "meter_egress", reply, ^uint32(0))
+		})
+	}
+}
+
 func TestKernelFirewallTCPHandshakeAndExpiry(t *testing.T) {
 	r := firewall.Rule{ID: "tcp", Direction: "ingress", Action: "allow", Source: "10.0.0.0/24", Destination: "*", Protocol: "tcp", DestinationPort: "443"}
 	m := firewallTestMeter(t, []firewall.Rule{r}, true, 1, 0)
@@ -418,9 +465,10 @@ func TestKernelFirewallTCPHandshakeAndExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := struct {
-		Lock, Stage uint32
-		Last        uint64
-	}{Stage: 3, Last: now - 301000000000}
+		Lock, Stage         uint32
+		Last                uint64
+		Generation, Padding uint32
+	}{Stage: 3, Last: now - 301000000000, Generation: 1}
 	if err := m.collection.Maps["connections"].Update(key, old, ebpf.UpdateAny); err != nil {
 		t.Fatal(err)
 	}
@@ -458,9 +506,10 @@ func TestKernelFirewallStateCapacityAndUDPExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := struct {
-		Lock, Stage uint32
-		Last        uint64
-	}{Stage: 1, Last: now - 31000000000}
+		Lock, Stage         uint32
+		Last                uint64
+		Generation, Padding uint32
+	}{Stage: 1, Last: now - 31000000000, Generation: 1}
 	if err := m.collection.Maps["connections"].Update(key, old, ebpf.UpdateAny); err != nil {
 		t.Fatal(err)
 	}

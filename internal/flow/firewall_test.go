@@ -84,6 +84,121 @@ func TestServicePartitionsAndRefreshesEndpointRules(t *testing.T) {
 	}
 }
 
+func TestReloadFirewallUpdatesOnlyChangedVethsAndRetries(t *testing.T) {
+	s, _, _, _, _ := testService(t)
+	makePolicy := func(rules []firewall.Rule) *firewall.Policy {
+		t.Helper()
+		kernel, err := firewall.Compile(rules)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &firewall.Policy{Config: firewall.Config{Enabled: true}, Rules: rules, Kernel: kernel, Generation: 1}
+	}
+	rules := []firewall.Rule{
+		{ID: "a", Direction: "both", Action: "allow", Source: "10.0.0.1", Destination: "*", Protocol: "udp", SandoMatch: true},
+		{ID: "b", Direction: "both", Action: "allow", Source: "10.0.0.2", Destination: "*", Protocol: "udp", SandoMatch: true},
+	}
+	initial := makePolicy(rules)
+	s.options.firewall = initial
+	first, second := &updatingFirewallMeter{}, &updatingFirewallMeter{}
+	for i, m := range []*updatingFirewallMeter{first, second} {
+		iface := Interface{Index: 7 + i, Name: fmt.Sprintf("veth_%d", i), IPv4: fmt.Sprintf("10.0.0.%d", i+1)}
+		p, err := initial.ForEndpoint(iface.IPv4, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.interfaces[iface.Index] = &observed{iface: iface, meter: m, firewall: p}
+	}
+	saves := 0
+	save := func() error { saves++; return nil }
+	// Removing a shifts b's global index, but must not touch b's veth/state.
+	next := makePolicy(rules[1:])
+	if n, err := s.ReloadFirewall(next, save); err != nil || n != 1 {
+		t.Fatalf("reload: updated=%d error=%v", n, err)
+	}
+	if len(first.updates) != 1 || first.updates[0].Generation != 2 || len(second.updates) != 0 ||
+		s.interfaces[8].firewall.Rules[1].ID != "b" {
+		t.Fatal("unaffected veth was reset or lost its log mapping")
+	}
+	rules[0].DestinationPort = "443"
+	rules[1].DestinationPort = "444"
+	next = makePolicy(rules)
+	if _, err := s.ReloadFirewall(next, func() error { return errors.New("disk full") }); err == nil {
+		t.Fatal("save error hidden")
+	}
+	if len(first.updates) != 1 || len(second.updates) != 0 {
+		t.Fatal("applied rules before persistence succeeded")
+	}
+	second.updateErr = errors.New("kernel blocked")
+	if n, err := s.ReloadFirewall(next, save); n != 1 || err == nil || !strings.Contains(err.Error(), "veth_1") {
+		t.Fatalf("partial reload: updated=%d error=%v", n, err)
+	}
+	second.updateErr = nil
+	if n, err := s.ReloadFirewall(next, save); n != 1 || err != nil {
+		t.Fatalf("retry: updated=%d error=%v", n, err)
+	}
+	if len(first.updates) != 2 || len(second.updates) != 1 || first.detached || first.closed || second.detached || second.closed {
+		t.Fatal("retry reset successful veths or detached capture")
+	}
+	if n, err := s.ReloadFirewall(next, save); n != 0 || err != nil {
+		t.Fatalf("identical policy re-applied: updated=%d error=%v", n, err)
+	}
+	over := make([]firewall.Rule, firewall.MaxRulesPerVeth+1)
+	for i := range over {
+		over[i] = firewall.Rule{ID: fmt.Sprint(i), Direction: "both", Action: "allow", Source: "*", Destination: "*", Protocol: "udp"}
+	}
+	before := saves
+	if _, err := s.ReloadFirewall(makePolicy(over), save); err == nil || !strings.Contains(err.Error(), "257 rules") {
+		t.Fatalf("over-capacity reload: %v", err)
+	}
+	if saves != before || len(first.updates) != 2 || len(second.updates) != 1 {
+		t.Fatal("invalid reload saved or applied a partial policy")
+	}
+}
+
+func TestDropLogNeverAttributesOldGenerationToNewRule(t *testing.T) {
+	var out bytes.Buffer
+	p := &firewall.Policy{Generation: 3, Rules: []firewall.Rule{{ID: "new-rule"}}}
+	drop := Drop{Generation: 1, Rule: 1, Direction: 1, Reason: 1}
+	if err := writeDrop(&out, "host", Interface{}, p, drop, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "new-rule") || !strings.Contains(out.String(), "generation:1/rule:1") {
+		t.Fatalf("old event mislabeled: %s", out.String())
+	}
+}
+
+func TestPollingAddressRefreshRevokesChangedRulesWithoutResettingUnchangedRules(t *testing.T) {
+	s, _, _, _, _ := testService(t)
+	rules := []firewall.Rule{
+		{ID: "one", Direction: "both", Action: "allow", Source: "10.0.0.0/24", Destination: "*", Protocol: "udp", SandoMatch: true},
+		{ID: "two", Direction: "both", Action: "allow", Source: "10.0.1.1", Destination: "*", Protocol: "udp", SandoMatch: true},
+	}
+	kernel, err := firewall.Compile(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &firewall.Policy{Config: firewall.Config{Enabled: true, SandoPoll: true}, Rules: rules, Kernel: kernel, Generation: 1}
+	s.options.firewall = p
+	m := &updatingFirewallMeter{}
+	o := s.interfaces[7]
+	o.meter = m
+	o.iface.IPv4 = "10.0.0.1"
+	o.firewall, err = p.ForEndpoint(o.iface.IPv4, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	iface := o.iface
+	iface.IPv4 = "10.0.0.2"
+	if err := s.Sync([]Interface{iface}); err != nil || len(m.updates) != 0 {
+		t.Fatalf("same effective rules reset state: %v", err)
+	}
+	iface.IPv4 = "10.0.1.1"
+	if err := s.Sync([]Interface{iface}); err != nil || len(m.updates) != 1 || m.updates[0].Generation != 2 {
+		t.Fatalf("changed address rules did not revoke state: %+v %v", m.updates, err)
+	}
+}
+
 func TestDropLogSyslogFormatAndEscaping(t *testing.T) {
 	var out bytes.Buffer
 	d := Drop{Key: Key{Family: 4, Protocol: 17, SourcePort: 1234, DestinationPort: 443},

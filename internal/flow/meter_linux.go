@@ -33,6 +33,7 @@ type kernelMeter struct {
 	dropReader *ringbuf.Reader
 	dropLoss   uint64
 	ruleSpec   *ebpf.MapSpec
+	generation uint32
 }
 
 type meterOptions struct {
@@ -155,9 +156,17 @@ func (m *kernelMeter) UpdateFirewall(p *firewall.Policy) (updateErr error) {
 			return fmt.Errorf("load veth firewall rule %d: %w", i, err)
 		}
 	}
+	generation := p.Generation
+	if generation == 0 {
+		generation = max(m.generation, 1)
+	}
+	if err := table.Update(uint32(firewall.MaxRulesPerVeth), firewall.KernelRule{ID: generation}, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("load firewall generation: %w", err)
+	}
 	if err := m.collection.Maps["rules"].Update(uint32(0), table, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("replace veth firewall table: %w", err)
 	}
+	m.generation = generation
 	return nil
 }
 

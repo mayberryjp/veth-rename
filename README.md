@@ -231,6 +231,8 @@ sando_rules: sando.yaml
 sando_endpoint: "http://192.0.2.10:8000"
 sando_direction: both
 sando_assignment: endpoint
+sando_poll: false
+sando_poll_interval: 60s
 drop_log: /var/log/veth-renamer/firewall-drops.log
 ```
 
@@ -238,8 +240,9 @@ Rule/log paths are relative to this configuration file unless absolute.
 `enabled` defaults to false, `permit_all_icmp` defaults to true (IPv4 ICMP and
 ICMPv6), and `sando_direction` defaults to `both`. The three paths are required
 when enabled. Unknown/duplicate keys, nulls, aliases, invalid rules and multiple
-YAML documents are errors. Restart the daemon to load configuration or policy
-changes; a sync command never changes a running daemon's policy.
+YAML documents are errors. Restart the daemon to load configuration changes.
+Policy changes also require restart unless Sando polling is enabled below;
+a one-shot sync command does not directly notify a running daemon.
 
 ### Enforce one direction, observe both
 
@@ -421,9 +424,10 @@ direction, ordering and original rule IDs. Applicable rules count toward
 each selected veth; the limit is never implemented by truncating the policy.
 
 When Docker reports an address change, reconciliation atomically replaces
-that veth's rule table without detaching either hook or clearing TCP/UDP
-state. Each packet sees one complete old or new table, not partially updated
-rules. Saved-policy changes still require restart. A failed or over-capacity
+that veth's rule table without detaching either hook. TCP/UDP state is retained
+unless Sando polling is enabled and the effective rules change. Each packet
+sees one complete old or new table, not partially updated
+rules. A failed or over-capacity
 refresh reports the veth name/count and retains its previous table.
 An over-capacity new veth is not attached and remains unprotected; other
 veths can still be reconciled.
@@ -457,7 +461,7 @@ sudo veth-renamer --firewall-config=/etc/veth-renamer/firewall.yaml --sando-sync
 sudo veth-renamer --firewall-config=/etc/veth-renamer/firewall.yaml --sando-dump
 ```
 
-Sync is explicit only: no startup or periodic downloads. HTTP errors, invalid
+Without polling, sync is explicit only: no startup or periodic downloads. HTTP errors, invalid
 responses, duplicate IDs, responses exceeding 4 MiB and file-write failures exit
 nonzero and preserve the last saved policy. A successful empty list removes
 all imported rules, not manual rules. Both rule files must exist before
@@ -469,7 +473,56 @@ the daemon when attaching or refreshing each endpoint, not during sync.
 written into generated rules, not the global enforcement scope. Assignment
 is done by the daemon using `sando_assignment` at attachment, since sync has
 no Docker endpoint inventory; the saved Sando file still contains all rules.
-Restart after syncing rules or changing assignment mode.
+Without polling, restart after syncing rules. Changing assignment mode always
+requires restart.
+
+### Automatic Sando updates (opt-in)
+
+```yaml
+sando_poll: true
+sando_poll_interval: 60s
+```
+
+Polling defaults to **disabled**. The interval defaults to **60s**, accepts Go
+durations such as `30s` or `2m`, and must be at least `1s`. Polling requires an
+enabled firewall and `sando_endpoint`. Both saved rule files must still exist
+at startup; the daemon starts with those rules, then fetches immediately and
+polls again at the configured interval after each result. Requests have a
+30-second timeout, are cancellable on shutdown, and run in a separate worker
+so slow Sando responses do not block Docker reconciliation or IPFIX polling.
+
+No Sando change is required: `GET /api/ignorelist` responses are validated and
+compared with each veth's effective rules. When Sando supplies an `ETag`, the
+next request includes `If-None-Match`; Sando may return **304 Not Modified**
+with no body. Otherwise it returns **200** with the existing JSON array and a
+new ETag. The validator must represent the complete list, including additions,
+edits, deletions and an empty list, and must change whenever that representation
+changes. A content hash of a consistently ordered response is suitable. The
+body and ETag must describe the same snapshot. No separate version endpoint
+or push notification is needed. Without ETags, ordinary downloads continue
+to work; unchanged policies are neither rewritten nor reinstalled.
+
+The daemon validates the combined manual/imported policy and every attached
+veth's capacity before atomically saving the generated file. It then replaces
+only changed veth tables without detaching hooks or restarting. Existing
+TCP/UDP state is revoked on those veths, including for previously permitted
+connections; veths with unchanged effective rules retain their tables and
+state even when another endpoint's rule deletion shifts global rule indices.
+This invalidates firewall permissions, not operating-system sockets or TCP
+sessions directly. Manual rules retain precedence and are never overwritten.
+
+HTTP/validation/capacity/save failures are logged and leave active policies
+unchanged. A kernel application failure is logged per veth: that veth retains
+its old table, successful veth updates remain active, and subsequent polls
+retry failed applications (including on 304). The saved file can therefore be
+ahead of a failed veth's active policy until retry succeeds. A successful empty
+list removes imported rules and revokes state only on affected veths.
+Policy swaps are atomic **per veth**, not across all veths simultaneously.
+Drop events retain their generation: very late events from older tables are
+identified by generation/rule index rather than attributed to a different rule.
+This is not a general configuration/file watcher: restart after editing
+firewall configuration or manual rules; do not rely on local generated-file
+edits, which polling replaces with Sando's policy.
 
 ### Capture, drops and deployment
 

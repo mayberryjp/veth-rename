@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -25,6 +26,8 @@ type Config struct {
 	SandoEndpoint        string `yaml:"sando_endpoint"`
 	SandoDirection       string `yaml:"sando_direction"`
 	SandoAssignment      string `yaml:"sando_assignment"`
+	SandoPoll            bool   `yaml:"sando_poll"`
+	SandoPollInterval    string `yaml:"sando_poll_interval"`
 	DropLog              string `yaml:"drop_log"`
 }
 
@@ -46,9 +49,10 @@ type RuleFile struct {
 }
 
 type Policy struct {
-	Config Config
-	Rules  []Rule
-	Kernel []KernelRule
+	Config     Config
+	Rules      []Rule
+	Kernel     []KernelRule
+	Generation uint32
 }
 
 type KernelRule struct {
@@ -100,7 +104,7 @@ func validateNodes(n *yaml.Node) error {
 			if key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
 				return fmt.Errorf("mapping keys must be strings")
 			}
-			if (key.Value == "enabled" || key.Value == "audit_mode" || key.Value == "permit_all_icmp" || key.Value == "sando_match") &&
+			if (key.Value == "enabled" || key.Value == "audit_mode" || key.Value == "permit_all_icmp" || key.Value == "sando_match" || key.Value == "sando_poll") &&
 				(value.Kind != yaml.ScalarNode || value.Tag != "!!bool") {
 				return fmt.Errorf("%s must be a boolean", key.Value)
 			}
@@ -120,7 +124,7 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, err
 	}
 	path = absolute
-	c := Config{PermitAllICMP: true, SandoDirection: "both", EnforcementDirection: "both", SandoAssignment: "endpoint"}
+	c := Config{PermitAllICMP: true, SandoDirection: "both", EnforcementDirection: "both", SandoAssignment: "endpoint", SandoPollInterval: "60s"}
 	if err := readYAML(path, &c); err != nil {
 		return c, err
 	}
@@ -135,6 +139,12 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if c.SandoAssignment != "endpoint" && c.SandoAssignment != "all_matches" {
 		return c, fmt.Errorf("sando_assignment must be endpoint or all_matches")
+	}
+	if interval, err := time.ParseDuration(c.SandoPollInterval); err != nil || interval < time.Second {
+		return c, fmt.Errorf("sando_poll_interval must be a duration of at least 1s")
+	}
+	if c.SandoPoll && (!c.Enabled || c.SandoEndpoint == "") {
+		return c, fmt.Errorf("sando_poll requires enabled firewall and sando_endpoint")
 	}
 	if c.SandoEndpoint != "" {
 		u, err := url.Parse(c.SandoEndpoint)
@@ -290,7 +300,7 @@ func (p *Policy) ForEndpoint(ipv4, ipv6 string) (*Policy, error) {
 			addresses[i] = a
 		}
 	}
-	selected := &Policy{Config: p.Config, Rules: p.Rules}
+	selected := &Policy{Config: p.Config, Rules: p.Rules, Generation: p.Generation}
 	for _, rule := range p.Kernel {
 		if rule.Flags&8 == 0 || relevant(rule, addresses, p.Config.SandoAssignment == "all_matches") {
 			selected.Kernel = append(selected.Kernel, rule)

@@ -8,6 +8,8 @@ import (
 	"os"
 	"sort"
 	"time"
+
+	"veth-rename/internal/firewall"
 )
 
 const shutdownBudget = 2 * time.Second
@@ -21,13 +23,15 @@ type meter interface {
 }
 
 type observed struct {
-	iface    Interface
-	meter    meter
-	table    flowTable
-	pending  []Record
-	losses   [2]uint64
-	dropped  uint64
-	retiring bool
+	iface            Interface
+	meter            meter
+	table            flowTable
+	pending          []Record
+	losses           [2]uint64
+	dropped          uint64
+	retiring         bool
+	firewall         *firewall.Policy
+	previousFirewall *firewall.Policy
 }
 
 type Service struct {
@@ -312,10 +316,25 @@ func (s *Service) Sync(interfaces []Interface) error {
 						errs = append(errs, fmt.Errorf("meter %s has no firewall updater", iface.Name))
 						continue
 					}
+					if o.firewall != nil {
+						options.firewall.Generation = o.firewall.Generation
+						if s.options.firewall.Config.SandoPoll {
+							if equalFirewall(o.firewall, options.firewall) {
+								o.iface = iface
+								continue
+							}
+							if o.firewall.Generation == ^uint32(0) {
+								errs = append(errs, fmt.Errorf("firewall generation exhausted on %s; restart required", iface.Name))
+								continue
+							}
+							options.firewall.Generation = max(o.firewall.Generation+1, 2)
+						}
+					}
 					if err := updater.UpdateFirewall(options.firewall); err != nil {
 						errs = append(errs, fmt.Errorf("update firewall %s: %w", iface.Name, err))
 						continue
 					}
+					o.previousFirewall, o.firewall = o.firewall, options.firewall
 				}
 				o.iface = iface
 			}
@@ -331,7 +350,7 @@ func (s *Service) Sync(interfaces []Interface) error {
 			errs = append(errs, fmt.Errorf("monitor %s: %w", iface.Name, err))
 			continue
 		}
-		s.interfaces[iface.Index] = &observed{iface: iface, meter: m, table: newTable(s.config)}
+		s.interfaces[iface.Index] = &observed{iface: iface, meter: m, table: newTable(s.config), firewall: options.firewall}
 	}
 	return errors.Join(errs...)
 }

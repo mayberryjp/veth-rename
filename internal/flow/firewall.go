@@ -16,7 +16,8 @@ type Drop struct {
 	Time              uint64
 	Rule, Octets      uint32
 	Direction, Reason uint8
-	Padding           [6]byte
+	Padding           [2]byte
+	Generation        uint32
 }
 
 type firewallMeter interface {
@@ -57,10 +58,98 @@ func (s *Service) EnableFirewall(p *firewall.Policy) error {
 	if err != nil {
 		return errors.Join(err, f.Close())
 	}
-	s.options.firewall = p
+	initial := *p
+	initial.Generation = 1
+	s.options.firewall = &initial
 	s.dropLog = f
 	s.logHost = host
 	return nil
+}
+
+// equalFirewall ignores global rule indices: removing another endpoint's rule
+// must not reset this endpoint's connection state or change its log mapping.
+func equalFirewall(a, b *firewall.Policy) bool {
+	if len(a.Kernel) != len(b.Kernel) {
+		return false
+	}
+	for i, left := range a.Kernel {
+		right := b.Kernel[i]
+		if a.Rules[left.ID-1].ID != b.Rules[right.ID-1].ID {
+			return false
+		}
+		left.ID, right.ID = 0, 0
+		if left != right {
+			return false
+		}
+	}
+	return true
+}
+
+// ReloadFirewall is serialized with Sync and Poll by the daemon. Validate all
+// endpoints before persisting, then replace only changed tables in place.
+// Kernel failures are per-veth; successful replacements are retained on retry.
+func (s *Service) ReloadFirewall(p *firewall.Policy, save func() error) (int, error) {
+	if s.options.firewall == nil || p.Config != s.options.firewall.Config {
+		return 0, fmt.Errorf("live reload requires an enabled firewall with unchanged configuration")
+	}
+	selected := make(map[int]*firewall.Policy)
+	for _, index := range s.indices() {
+		o := s.interfaces[index]
+		if o.retiring {
+			continue
+		}
+		next, err := p.ForEndpoint(o.iface.IPv4, o.iface.IPv6)
+		if err != nil {
+			return 0, fmt.Errorf("firewall %s: %w", o.iface.Name, err)
+		}
+		if o.firewall == nil {
+			o.firewall, err = s.options.firewall.ForEndpoint(o.iface.IPv4, o.iface.IPv6)
+			if err != nil {
+				return 0, err
+			}
+		}
+		if equalFirewall(o.firewall, next) {
+			continue
+		}
+		if _, ok := o.meter.(firewallMeter); !ok {
+			return 0, fmt.Errorf("meter %s has no firewall updater", o.iface.Name)
+		}
+		if o.firewall.Generation == ^uint32(0) {
+			return 0, fmt.Errorf("firewall generation exhausted on %s; restart required", o.iface.Name)
+		}
+		next.Generation = o.firewall.Generation + 1
+		// Generation zero is reserved for legacy/test policies and malformed packets.
+		if next.Generation == 1 {
+			next.Generation = 2
+		}
+		selected[index] = next
+	}
+	if err := save(); err != nil {
+		return 0, fmt.Errorf("save Sando policy: %w", err)
+	}
+	desired := *p
+	desired.Generation = 1
+	s.options.firewall = &desired
+	var errs []error
+	updated := 0
+	for _, index := range s.indices() {
+		next, ok := selected[index]
+		if !ok {
+			continue
+		}
+		o := s.interfaces[index]
+		if err := s.logDrops(o); err != nil {
+			errs = append(errs, fmt.Errorf("drain firewall %s before reload: %w", o.iface.Name, err))
+			continue
+		}
+		if err := o.meter.(firewallMeter).UpdateFirewall(next); err != nil {
+			errs = append(errs, fmt.Errorf("reload firewall %s: %w", o.iface.Name, err))
+			continue
+		}
+		o.previousFirewall, o.firewall = o.firewall, next
+		updated++
+	}
+	return updated, errors.Join(errs...)
 }
 
 func address(a [16]byte, family uint8) string {
@@ -77,10 +166,15 @@ func address(a [16]byte, family uint8) string {
 func writeDrop(out io.Writer, host string, iface Interface, policy *firewall.Policy, drop Drop, timestamp time.Time) error {
 	rule := "default"
 	if drop.Rule != 0 {
-		if int(drop.Rule) > len(policy.Rules) {
-			return fmt.Errorf("invalid firewall drop rule index %d", drop.Rule)
+		if drop.Generation != policy.Generation {
+			// A packet already in flight can emit after its table was replaced.
+			rule = fmt.Sprintf("generation:%d/rule:%d", drop.Generation, drop.Rule)
+		} else {
+			if int(drop.Rule) > len(policy.Rules) {
+				return fmt.Errorf("invalid firewall drop rule index %d", drop.Rule)
+			}
+			rule = policy.Rules[drop.Rule-1].ID
 		}
-		rule = policy.Rules[drop.Rule-1].ID
 	}
 	direction := "ingress"
 	if drop.Direction == 2 {
@@ -111,8 +205,15 @@ func (s *Service) logDrops(o *observed) error {
 	}
 	drops, readErr := m.ReadDrops()
 	for i, drop := range drops {
+		policy := o.firewall
+		if policy == nil {
+			policy = s.options.firewall
+		}
+		if drop.Generation != policy.Generation && o.previousFirewall != nil && drop.Generation == o.previousFirewall.Generation {
+			policy = o.previousFirewall
+		}
 		timestamp := time.Unix(0, s.export.bootUnixNS+int64(drop.Time))
-		if err := writeDrop(s.dropLog, s.logHost, o.iface, s.options.firewall, drop, timestamp); err != nil {
+		if err := writeDrop(s.dropLog, s.logHost, o.iface, policy, drop, timestamp); err != nil {
 			return errors.Join(readErr, fmt.Errorf("write firewall drop log: %w; unlogged_drops=%d", err, len(drops)-i))
 		}
 	}
