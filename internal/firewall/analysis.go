@@ -26,6 +26,7 @@ type DropTuple struct {
 type DropSummary struct {
 	DropTuple
 	Packets, Bytes uint64
+	LastSeen       time.Time
 }
 
 func ParseLookback(value string) (time.Duration, error) {
@@ -135,6 +136,9 @@ func AnalyzeDrops(input io.Reader, now time.Time, lookback time.Duration, sortBy
 			return nil, fmt.Errorf("firewall log line %d: counter overflow", lineNumber)
 		}
 		total.DropTuple = key
+		if total.Packets == 0 || when.After(total.LastSeen) {
+			total.LastSeen = when
+		}
 		total.Packets++
 		total.Bytes += octets
 		totals[key] = total
@@ -164,13 +168,13 @@ func AnalyzeDrops(input io.Reader, now time.Time, lookback time.Duration, sortBy
 
 func WriteDropSummary(out io.Writer, rows []DropSummary) error {
 	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(w, "PACKETS\tBYTES\tSOURCE\tDESTINATION\tDPORT\tPROTO\tINTERFACE\tDIR\tACTION\tRULE\tREASON"); err != nil {
+	if _, err := fmt.Fprintln(w, "PACKETS\tBYTES\tSOURCE\tDESTINATION\tDPORT\tPROTO\tINTERFACE\tDIR\tACTION\tRULE\tREASON\tLAST_SEEN"); err != nil {
 		return err
 	}
 	for _, row := range rows {
-		if _, err := fmt.Fprintf(w, "%d\t%d\t%s\t%s\t%d\t%d\t%q\t%s\t%s\t%q\t%s\n",
+		if _, err := fmt.Fprintf(w, "%d\t%d\t%s\t%s\t%d\t%d\t%q\t%s\t%s\t%q\t%s\t%s\n",
 			row.Packets, row.Bytes, row.Source, row.Destination, row.DestinationPort, row.Protocol,
-			row.Interface, row.Direction, row.Action, row.Rule, row.Reason); err != nil {
+			row.Interface, row.Direction, row.Action, row.Rule, row.Reason, row.LastSeen.UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
 	}

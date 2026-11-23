@@ -34,7 +34,8 @@ func TestAnalyzeDropsWindowAggregationAndRanking(t *testing.T) {
 			t.Fatalf("analysis: %+v %v", rows, err)
 		}
 		if rows[0].DestinationPort != 443 || rows[0].Packets != tc.packets || rows[0].Bytes != tc.octets ||
-			rows[0].Rule != "deny\nquoted\"" || rows[0].Interface != "veth app" {
+			rows[0].Rule != "deny\nquoted\"" || rows[0].Interface != "veth app" ||
+			!rows[0].LastSeen.Equal(now.Add(-time.Hour)) {
 			t.Fatalf("wrong aggregate: %+v", rows[0])
 		}
 		rows, err = AnalyzeDrops(strings.NewReader(input), now, tc.window, "bytes")
@@ -48,6 +49,31 @@ func TestAnalyzeDropsWindowAggregationAndRanking(t *testing.T) {
 		if strings.Count(out.String(), "\n") != 3 || !strings.Contains(out.String(), `"deny\nquoted\""`) {
 			t.Fatalf("unsafe or missing output: %q", out.String())
 		}
+	}
+}
+
+func TestAnalyzeDropsLastSeenOutOfOrder(t *testing.T) {
+	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	latest := now.Add(-time.Minute + 123456789*time.Nanosecond)
+	input := analysisRecord(latest.In(time.FixedZone("UTC+9", 9*60*60)), 40000, 40) +
+		analysisRecord(now.Add(-10*time.Minute), 50000, 60) +
+		analysisRecord(now.Add(-5*time.Minute), 50001, 70) +
+		analysisRecord(now.Add(time.Second), 50002, 80)
+	rows, err := AnalyzeDrops(strings.NewReader(input), now, 20*time.Minute, "packets")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("analysis: %+v %v", rows, err)
+	}
+	if rows[0].Packets != 3 || rows[0].Bytes != 170 || !rows[0].LastSeen.Equal(latest) {
+		t.Fatalf("incorrect last seen or aggregate: %+v", rows[0])
+	}
+	var out bytes.Buffer
+	if err := WriteDropSummary(&out, rows); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 || !strings.HasSuffix(lines[0], "LAST_SEEN") ||
+		!strings.HasSuffix(lines[1], "2026-01-02T11:59:00.123456789Z") {
+		t.Fatalf("missing or incorrect last seen column: %q", out.String())
 	}
 }
 
@@ -121,7 +147,8 @@ func TestAnalyzeDropsLegacyIPv6AndSeparateVerdicts(t *testing.T) {
 	future := strings.Replace(current, "00:00:00", "02:00:00", 1)
 	rows, err := AnalyzeDrops(strings.NewReader(legacy+audit+current+future), now, 24*time.Hour, "packets")
 	if err != nil || len(rows) != 2 || rows[0].Packets != 2 || rows[1].Packets != 1 ||
-		rows[0].Action != "DROP" || rows[1].Action != "WOULD_DROP" || rows[0].Source != "2001:db8::1" {
+		rows[0].Action != "DROP" || rows[1].Action != "WOULD_DROP" || rows[0].Source != "2001:db8::1" ||
+		!rows[0].LastSeen.Equal(now.Add(-time.Hour)) || !rows[1].LastSeen.Equal(now.Add(-2*time.Hour)) {
 		t.Fatalf("legacy/audit: %+v %v", rows, err)
 	}
 	// Explicit years must not be reinterpreted as recent traffic.

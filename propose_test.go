@@ -43,6 +43,10 @@ func TestProposeRulesCLI(t *testing.T) {
 		if err != nil || len(lines) != 2 || strings.Fields(lines[1])[0] != tc.packets {
 			t.Fatalf("CLI %v: %q %v", tc.args, out, err)
 		}
+		if !strings.HasSuffix(lines[0], "LAST_SEEN") ||
+			!strings.HasSuffix(lines[1], now.Add(-time.Hour).UTC().Format(time.RFC3339Nano)) {
+			t.Fatalf("CLI missing last seen timestamp: %q", out)
+		}
 	}
 	for _, args := range [][]string{
 		{"--propose-rules"},
