@@ -333,9 +333,10 @@ Rows aggregate normalized source IP, destination IP, destination port and numeri
 IP protocol, ignoring ephemeral client ports. Interface, normalized direction,
 verdict, rule ID and reason remain separate so independent rule matches and actual
 versus would-be drops are not conflated. `PACKETS` counts matching log records;
-`BYTES` sums `LEN`. `LAST_SEEN` is the newest matching log timestamp within the
-selected window, displayed as an RFC3339 timestamp in UTC (including fractional
-seconds when present), regardless of log record order.
+`BYTES` sums `LEN`. `LAST_SEEN` is the age of the newest matching log record within
+the selected window, displayed in whole minutes (for example, `2 minutes ago`),
+regardless of log record order or timezone. Records less than a minute old show
+`0 minutes ago`. Ages use the same reference time as the lookback window.
 ICMP's destination field is `(type << 8) | code`.
 No matching records produces only the table header. Malformed records and
 read errors fail explicitly rather than silently producing incomplete results.

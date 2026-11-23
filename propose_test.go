@@ -44,7 +44,7 @@ func TestProposeRulesCLI(t *testing.T) {
 			t.Fatalf("CLI %v: %q %v", tc.args, out, err)
 		}
 		if !strings.HasSuffix(lines[0], "LAST_SEEN") ||
-			!strings.HasSuffix(lines[1], now.Add(-time.Hour).UTC().Format(time.RFC3339Nano)) {
+			!strings.HasSuffix(lines[1], "60 minutes ago") {
 			t.Fatalf("CLI missing last seen timestamp: %q", out)
 		}
 	}

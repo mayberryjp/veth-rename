@@ -23,5 +23,5 @@ func proposeRules(out io.Writer, path, since, sortBy string, now time.Time) erro
 	if err := errors.Join(readErr, f.Close()); err != nil {
 		return err
 	}
-	return firewall.WriteDropSummary(out, rows)
+	return firewall.WriteDropSummary(out, rows, now)
 }

@@ -166,15 +166,20 @@ func AnalyzeDrops(input io.Reader, now time.Time, lookback time.Duration, sortBy
 	return rows, nil
 }
 
-func WriteDropSummary(out io.Writer, rows []DropSummary) error {
+func WriteDropSummary(out io.Writer, rows []DropSummary, now time.Time) error {
 	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 	if _, err := fmt.Fprintln(w, "PACKETS\tBYTES\tSOURCE\tDESTINATION\tDPORT\tPROTO\tINTERFACE\tDIR\tACTION\tRULE\tREASON\tLAST_SEEN"); err != nil {
 		return err
 	}
 	for _, row := range rows {
+		minutes := int64(now.Sub(row.LastSeen) / time.Minute)
+		unit := "minutes"
+		if minutes == 1 {
+			unit = "minute"
+		}
 		if _, err := fmt.Fprintf(w, "%d\t%d\t%s\t%s\t%d\t%d\t%q\t%s\t%s\t%q\t%s\t%s\n",
 			row.Packets, row.Bytes, row.Source, row.Destination, row.DestinationPort, row.Protocol,
-			row.Interface, row.Direction, row.Action, row.Rule, row.Reason, row.LastSeen.UTC().Format(time.RFC3339Nano)); err != nil {
+			row.Interface, row.Direction, row.Action, row.Rule, row.Reason, fmt.Sprintf("%d %s ago", minutes, unit)); err != nil {
 			return err
 		}
 	}

@@ -43,7 +43,7 @@ func TestAnalyzeDropsWindowAggregationAndRanking(t *testing.T) {
 			t.Fatalf("byte ranking: %+v %v", rows, err)
 		}
 		var out bytes.Buffer
-		if err := WriteDropSummary(&out, rows); err != nil {
+		if err := WriteDropSummary(&out, rows, now); err != nil {
 			t.Fatal(err)
 		}
 		if strings.Count(out.String(), "\n") != 3 || !strings.Contains(out.String(), `"deny\nquoted\""`) {
@@ -67,13 +67,39 @@ func TestAnalyzeDropsLastSeenOutOfOrder(t *testing.T) {
 		t.Fatalf("incorrect last seen or aggregate: %+v", rows[0])
 	}
 	var out bytes.Buffer
-	if err := WriteDropSummary(&out, rows); err != nil {
+	if err := WriteDropSummary(&out, rows, now); err != nil {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
 	if len(lines) != 2 || !strings.HasSuffix(lines[0], "LAST_SEEN") ||
-		!strings.HasSuffix(lines[1], "2026-01-02T11:59:00.123456789Z") {
+		!strings.HasSuffix(lines[1], "0 minutes ago") {
 		t.Fatalf("missing or incorrect last seen column: %q", out.String())
+	}
+}
+
+func TestWriteDropSummaryRelativeLastSeen(t *testing.T) {
+	now := time.Date(2026, 1, 2, 0, 5, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		age  time.Duration
+		want string
+	}{
+		{0, "0 minutes ago"},
+		{59 * time.Second, "0 minutes ago"},
+		{time.Minute, "1 minute ago"},
+		{119 * time.Second, "1 minute ago"},
+		{2 * time.Minute, "2 minutes ago"},
+		{65 * time.Minute, "65 minutes ago"},
+	} {
+		t.Run(tc.want+"/"+tc.age.String(), func(t *testing.T) {
+			lastSeen := now.Add(-tc.age).In(time.FixedZone("JST", 9*60*60))
+			var out bytes.Buffer
+			if err := WriteDropSummary(&out, []DropSummary{{LastSeen: lastSeen}}, now); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasSuffix(out.String(), tc.want+"\n") {
+				t.Fatalf("incorrect relative last seen: %q", out.String())
+			}
+		})
 	}
 }
 
@@ -191,13 +217,13 @@ func TestAnalyzeDropsReportsErrors(t *testing.T) {
 	}
 	rows, err := AnalyzeDrops(strings.NewReader(" \n"), now, time.Hour, "bytes")
 	var out bytes.Buffer
-	if err != nil || WriteDropSummary(&out, rows) != nil || strings.Count(out.String(), "\n") != 1 {
+	if err != nil || WriteDropSummary(&out, rows, now) != nil || strings.Count(out.String(), "\n") != 1 {
 		t.Fatal("empty log should produce only a header")
 	}
-	if err := WriteDropSummary(io.Discard, rows); err != nil {
+	if err := WriteDropSummary(io.Discard, rows, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteDropSummary(failedAnalysisWriter{}, rows); err == nil {
+	if err := WriteDropSummary(failedAnalysisWriter{}, rows, now); err == nil {
 		t.Fatal("output failure hidden")
 	}
 }
