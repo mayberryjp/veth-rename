@@ -17,4 +17,4 @@ sando_assignment: endpoint
 # Opt in to background polling and live policy updates (no restart).
 sando_poll: false
 sando_poll_interval: 60s
-drop_log: /var/log/veth-renamer/firewall-drops.log
+drop_log: /var/log/veth-manager/firewall-drops.log

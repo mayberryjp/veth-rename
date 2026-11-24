@@ -1,4 +1,4 @@
-module veth-rename
+module veth-manager
 
 go 1.23
 

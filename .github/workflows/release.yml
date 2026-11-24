@@ -22,7 +22,7 @@ jobs:
       - name: Check eBPF generation
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-14 libbpf-dev
+          sudo apt-get install -y clang-14 libbpf-dev logrotate
           go generate ./internal/flow
       - run: go test -race ./...
       - run: go vet ./...
@@ -32,14 +32,15 @@ jobs:
           sudo unshare --net env FLOW_INTEGRATION=1 "$RUNNER_TEMP/flow.test" -test.run '^TestKernel' -test.v
       - name: Test controlled interface repair in an isolated network namespace
         run: |
-          go test -c -o "$RUNNER_TEMP/veth-renamer.test" .
-          sudo env PRIMARY_REPAIR_INTEGRATION=1 "$RUNNER_TEMP/veth-renamer.test" -test.run '^TestPrimaryRepairKernelIntegration$' -test.v
+          go test -c -o "$RUNNER_TEMP/veth-manager.test" .
+          sudo env PRIMARY_REPAIR_INTEGRATION=1 "$RUNNER_TEMP/veth-manager.test" -test.run '^TestPrimaryRepairKernelIntegration$' -test.v
       - name: Validate shell scripts
         run: |
           for script in install.sh tests/*.sh .github/scripts/*.sh; do bash -n "$script"; done
           for script in packaging/*.sh; do sh -n "$script"; done
           shellcheck install.sh tests/*.sh packaging/*.sh .github/scripts/*.sh
       - run: bash tests/installer_test.sh
+      - run: bash tests/logrotate_test.sh
       - name: Install verified GoReleaser through the GitHub API
         run: bash .github/scripts/setup-goreleaser.sh
         env:

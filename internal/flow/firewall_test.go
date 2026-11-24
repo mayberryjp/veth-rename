@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"veth-rename/internal/firewall"
+	"veth-manager/internal/firewall"
 )
 
 type updatingFirewallMeter struct {
@@ -199,6 +199,25 @@ func TestPollingAddressRefreshRevokesChangedRulesWithoutResettingUnchangedRules(
 	}
 }
 
+func TestFragmentDropLogAnalysis(t *testing.T) {
+	for reason, name := range map[uint8]string{
+		6: "fragment-unauthorized", 7: "fragment-invalid", 8: "fragment-table-full",
+	} {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			when := time.Now()
+			drop := Drop{Key: Key{Family: 4, Protocol: 17}, Direction: 1, Reason: reason, Octets: 36}
+			if err := writeDrop(&out, "host", Interface{Name: "veth_app"}, &firewall.Policy{}, drop, when); err != nil {
+				t.Fatal(err)
+			}
+			rows, err := firewall.AnalyzeDrops(&out, when, time.Minute, "packets")
+			if err != nil || len(rows) != 1 || rows[0].Reason != name || rows[0].Bytes != 36 {
+				t.Fatalf("fragment reason round trip: %+v %v", rows, err)
+			}
+		})
+	}
+}
+
 func TestDropLogSyslogFormatAndEscaping(t *testing.T) {
 	var out bytes.Buffer
 	d := Drop{Key: Key{Family: 4, Protocol: 17, SourcePort: 1234, DestinationPort: 443},
@@ -210,8 +229,9 @@ func TestDropLogSyslogFormatAndEscaping(t *testing.T) {
 	if err := writeDrop(&out, "host", Interface{Name: "veth_app"}, p, d, when); err != nil {
 		t.Fatal(err)
 	}
+
 	log := out.String()
-	if !strings.HasPrefix(log, "Nov 23 12:30:00 host veth-renamer[") ||
+	if !strings.HasPrefix(log, "Nov 23 12:30:00 host veth-manager[") ||
 		!strings.Contains(log, `DROP IF="veth_app" DIR=ingress SRC=10.0.0.1 DST=10.0.0.2 PROTO=17 SPT=1234 DPT=443 LEN=28 RULE="deny\nforged" REASON=rule-deny`) ||
 		strings.Count(log, "\n") != 1 {
 		t.Fatalf("syslog: %q", log)

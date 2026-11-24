@@ -18,7 +18,7 @@ import (
 	"testing"
 
 	"gopkg.in/yaml.v3"
-	"veth-rename/internal/firewall"
+	"veth-manager/internal/firewall"
 )
 
 func TestSandoSyncCLIHelper(t *testing.T) {

@@ -1,4 +1,10 @@
-# veth-renamer
+# veth-manager
+
+Successor to [mayberryjp/veth-rename](https://github.com/mayberryjp/veth-rename).
+The binary, Debian package, systemd service and default configuration/log paths
+now use `veth-manager`. Docker label names and network behavior are unchanged.
+See [migration instructions](#migrating-from-veth-rename--veth-renamer) before
+replacing an existing installation.
 
 A small Go daemon for **rootful Docker Engine on an Ubuntu
 host**. It reads container labels, finds the matching host-side bridge veth,
@@ -10,7 +16,7 @@ host interfaces and maintains readable vnStat aliases automatically.
 ## Optional eBPF / IPFIX traffic monitoring
 
 Renaming and vnStat behavior are unchanged. Enable the independent exporter
-with `--ipfix-config=/etc/veth-renamer/ipfix.yaml`. It monitors only verified
+with `--ipfix-config=/etc/veth-manager/ipfix.yaml`. It monitors only verified
 host-side veths belonging to containers managed by the existing rename labels,
 including DHCP bridge veths. Unlabeled containers, macvlan, shared bridges,
 physical NICs and container-side interfaces are excluded. Failed or ambiguous
@@ -28,12 +34,12 @@ are not captured; Docker events and periodic reconciliation discover new veths.
 Copy and edit the supplied example, then install the opt-in systemd drop-in:
 
 ```bash
-sudo install -d -m 0755 /etc/veth-renamer /etc/systemd/system/veth-renamer.service.d
-sudo install -m 0644 /usr/share/doc/veth-renamer/ipfix.example.yaml /etc/veth-renamer/ipfix.yaml
-# Set collector and timers in /etc/veth-renamer/ipfix.yaml before starting.
-sudo install -m 0644 /usr/share/doc/veth-renamer/ipfix.conf /etc/systemd/system/veth-renamer.service.d/ipfix.conf
+sudo install -d -m 0755 /etc/veth-manager /etc/systemd/system/veth-manager.service.d
+sudo install -m 0644 /usr/share/doc/veth-manager/ipfix.example.yaml /etc/veth-manager/ipfix.yaml
+# Set collector and timers in /etc/veth-manager/ipfix.yaml before starting.
+sudo install -m 0644 /usr/share/doc/veth-manager/ipfix.conf /etc/systemd/system/veth-manager.service.d/ipfix.conf
 sudo systemctl daemon-reload
-sudo systemctl restart veth-renamer
+sudo systemctl restart veth-manager
 ```
 
 For source installs, use `deploy/ipfix.example.yaml` and `deploy/ipfix.conf`
@@ -174,9 +180,10 @@ coalescing/segmentation offloads on both ends separately; the daemon deliberatel
 does not alter offload settings or the rename operation.
 
 IPv6 extension chains (up to eight headers) and up to two VLAN headers are
-parsed. IPv4 fragments (including first fragments) and all IPv6 Fragment
-headers (including atomic fragments) are excluded rather than guessed into
-portless flows. Sampled exclusions are counted separately in the kernel;
+parsed. Real IPv4/IPv6 fragments (including first fragments) are excluded from
+IPFIX rather than guessed into portless flows. IPv6 atomic fragments are
+complete packets and are parsed, filtered and metered normally.
+Sampled exclusions are counted separately in the kernel;
 they are intentional exclusions, not capacity/malformed errors. IPv6 jumbo
 payloads, longer extension chains and malformed IP headers increment explicit
 unsupported/malformed counters. Non-IP traffic is outside this feature's scope.
@@ -215,7 +222,7 @@ not hard-code record widths.
 ## Optional eBPF firewall and Sando ignore-list import
 
 Firewalling is **disabled by default**. Add
-`--firewall-config=/etc/veth-renamer/firewall.yaml` alongside `--ipfix-config`.
+`--firewall-config=/etc/veth-manager/firewall.yaml` alongside `--ipfix-config`.
 Only `enabled: true` activates enforcement; an omitted or false `enabled`
 leaves the exporter observational and does not open the drop log or load rules.
 Enabled firewalling requires daemon mode and IPFIX configuration. The same
@@ -233,7 +240,7 @@ sando_direction: both
 sando_assignment: endpoint
 sando_poll: false
 sando_poll_interval: 60s
-drop_log: /var/log/veth-renamer/firewall-drops.log
+drop_log: /var/log/veth-manager/firewall-drops.log
 ```
 
 Rule/log paths are relative to this configuration file unless absolute.
@@ -309,9 +316,9 @@ results are a preview, not a guarantee of identical future traffic.
 
 ```bash
 # Default: last 24 hours, ranked by logged packet count.
-sudo veth-renamer --propose-rules --firewall-config=/etc/veth-renamer/firewall.yaml
+sudo veth-manager --propose-rules --firewall-config=/etc/veth-manager/firewall.yaml
 # Last seven days, ranked by bytes; no configuration or Docker access needed.
-sudo veth-renamer --propose-rules --firewall-log=/var/log/veth-renamer/firewall-drops.log --since=7d --sort=bytes
+sudo veth-manager --propose-rules --firewall-log=/var/log/veth-manager/firewall-drops.log --since=7d --sort=bytes
 ```
 
 `--since` accepts positive Go durations (e.g. `12h`, `168h`) or whole days
@@ -382,6 +389,39 @@ State is lost on detach, interface replacement or process restart.
 DHCP, other broadcast traffic and multicast are not automatically allowed;
 add explicit rules where needed. Reply state requires the exact reversed
 tuple and does not associate a broadcast request with a unicast reply.
+
+### Fragment handling
+
+Firewall enforcement remains entirely in TC eBPF; it does not move to
+Netfilter/nftables or perform packet reassembly. A first IPv4/IPv6 fragment
+with complete supported transport headers is checked against ordinary rules
+and TCP/UDP state. Only a policy allow authorizes its later fragments;
+audit mode and unselected enforcement hooks do not turn a denial into an
+authorization. Later fragments use that datagram authorization without
+inventing ports or updating connection state.
+
+The non-LRU cache holds **1,024 datagrams per veth**, shared by both hooks.
+Keys include interface index, direction, VLAN tags, addresses, IP version,
+protocol and fragment ID. Authorizations are bound to the active policy
+generation and expire **30 seconds after the first fragment**, without
+refreshing on subsequent traffic. Polling reclaims expired/old-generation
+entries. Completed and invalid entries retain their slot until expiry to
+reject immediate fragment-ID reuse.
+
+Fragments arriving before the first are dropped; after the first is
+authorized, the remaining fragments may arrive out of order. At most
+**64 fragments per datagram** are accepted. Overlaps, duplicates, inconsistent
+final lengths and range-limit violations invalidate that authorization.
+Tiny first fragments, invalid sizes/offsets and incomplete headers are
+rejected. Fragmented UDP also must agree with its declared datagram length.
+IPv6 atomic fragments need no cache and follow normal filtering/metering.
+
+Cache misses, expired/revoked authorizations and fragments of denied datagrams
+are logged as `fragment-unauthorized`; conflicting IDs, overlapping ranges
+and inconsistent lengths as `fragment-invalid`; cache admission failures as
+`fragment-table-full`. Malformed packets retain the `malformed` reason.
+These bounds intentionally fail closed and are not equivalent to PF's
+buffer-and-reassemble behavior.
 
 ### Manual and imported rules
 
@@ -466,11 +506,11 @@ Use HTTPS or a trusted management network; redirects are rejected.
 ```bash
 # Fetch, validate against manual rules, atomically replace only sando.yaml,
 # print the generated YAML, and exit. Works while firewalling is disabled.
-sudo veth-renamer --firewall-config=/etc/veth-renamer/firewall.yaml --sando-sync
+sudo veth-manager --firewall-config=/etc/veth-manager/firewall.yaml --sando-sync
 # Override sando_direction for this sync only (does not edit firewall.yaml).
-sudo veth-renamer --firewall-config=/etc/veth-renamer/firewall.yaml --sando-sync --sando-direction=ingress
+sudo veth-manager --firewall-config=/etc/veth-manager/firewall.yaml --sando-sync --sando-direction=ingress
 # Print the saved generated policy without contacting Sando.
-sudo veth-renamer --firewall-config=/etc/veth-renamer/firewall.yaml --sando-dump
+sudo veth-manager --firewall-config=/etc/veth-manager/firewall.yaml --sando-dump
 ```
 
 Without polling, sync is explicit only: no startup or periodic downloads. HTTP errors, invalid
@@ -542,8 +582,9 @@ The same hook submits eligible IPFIX metadata **before** returning a firewall
 drop, so denied flows remain visible. Existing IPFIX sampling, capture filters,
 fragment exclusions, collector exclusions and bounded-buffer losses still
 apply; use `sampling_rate: 1` and `capture_filter: ""` for fullest visibility.
-Excluded fragments and malformed/unsupported packets are denied and logged,
-but are not guessed into IPFIX flows. Non-IP frames other than ARP are denied.
+Real fragments remain excluded from IPFIX even when the firewall permits
+them. Fragment authorization failures and malformed/unsupported packets
+are denied and logged. Non-IP frames other than ARP are denied.
 A full IPFIX buffer never bypasses firewall enforcement. This order applies
 within this daemon's hook; it cannot observe packets dropped by an earlier
 external classifier.
@@ -552,22 +593,41 @@ Drop events are independent of IPFIX sampling and written to `drop_log` in
 syslog-style human-readable lines, not JSON:
 
 ```text
-Nov 23 12:30:00 host veth-renamer[1234]: DROP IF="veth_app" DIR=ingress SRC=10.0.0.1 DST=203.0.113.1 PROTO=6 SPT=42000 DPT=80 LEN=40 RULE="default" REASON=default-deny TIME=2026-11-23T12:30:00Z
+Nov 23 12:30:00 host veth-manager[1234]: DROP IF="veth_app" DIR=ingress SRC=10.0.0.1 DST=203.0.113.1 PROTO=6 SPT=42000 DPT=80 LEN=40 RULE="default" REASON=default-deny TIME=2026-11-23T12:30:00Z
 ```
 
 Each line includes packet time, interface, direction, tuple, length, matched
 rule and reason. Rule/interface strings are escaped to prevent multiline
 records. Logs use a separate 1 MiB ring per veth; overflow and write failures
 are explicit daemon errors, never permission to pass traffic. The daemon
-opens the log in append mode (new files 0600). Use external rotation with
-`copytruncate`, or restart after rename-based rotation. Parent directories
+opens the log in append mode (new files 0600). Parent directories
 must exist; the supplied systemd drop-in creates the default log directory.
 
-Install the four supplied firewall examples from `/usr/share/doc/veth-renamer/`
+Debian packages install `/etc/logrotate.d/veth-manager` and depend on `logrotate`.
+The default `/var/log/veth-manager/firewall-drops.log` rotates daily or when it
+exceeds 10 MiB at a logrotate check, retaining 7 compressed archives. Missing or
+empty logs are skipped. `copytruncate` keeps the daemon writing without a restart,
+but records written between copying and truncating can be lost. The size trigger
+is not a strict cap: logs can exceed 10 MiB between checks, and daily rotation is
+performed only when logrotate runs. Verify the host's logrotate timer or cron job
+is enabled; more frequent checks are needed for a busy log.
+
+For source/archive installs, install the supplied configuration:
+
+```bash
+sudo install -m 0644 deploy/veth-manager.logrotate /etc/logrotate.d/veth-manager
+sudo logrotate --debug /etc/logrotate.d/veth-manager
+```
+
+If `drop_log` uses a custom path, update the logrotate entry to match. Rotation
+does not change `--propose-rules`: it reads only the selected active log, not
+archives, so its available history shrinks after rotation.
+
+Install the four supplied firewall examples from `/usr/share/doc/veth-manager/`
 (or `deploy/` for source installs): `firewall.example.yaml` as
-`/etc/veth-renamer/firewall.yaml`, `manual.example.yaml` as `manual.yaml`,
+`/etc/veth-manager/firewall.yaml`, `manual.example.yaml` as `manual.yaml`,
 `sando.example.yaml` as `sando.yaml`, and `firewall.conf` as
-`/etc/systemd/system/veth-renamer.service.d/firewall.conf`. **Replace/remove the
+`/etc/systemd/system/veth-manager.service.d/firewall.conf`. **Replace/remove the
 previous `ipfix.conf` drop-in** rather than having competing `ExecStart`
 overrides. Set your collector and Sando endpoint, sync and inspect the policy,
 then explicitly set `enabled: true`, run `systemctl daemon-reload`, and restart.
@@ -636,7 +696,7 @@ Without vnStat installed, name conflicts remain errors rather than being
 reported as repaired.
 
 Deploy the new binary **and** updated systemd unit, then reload systemd and
-restart `veth-renamer.service`. The packaged unit starts after vnStat.
+restart `veth-manager.service`. The packaged unit starts after vnStat.
 Explicit primary/alternative modes retain strict naming behavior; primary
 mode does not take links down and can still fail on an UP device.
 vnStat must already be installed; vnstatd initializes and collects into its
@@ -768,10 +828,10 @@ sudo ip link property del dev veth_original altname veth_old
 ## One-line installation (Ubuntu)
 
 Once a release is published in
-[mayberryjp/veth-rename](https://github.com/mayberryjp/veth-rename):
+[mayberryjp/veth-manager](https://github.com/mayberryjp/veth-manager):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-rename/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-manager/main/install.sh | bash
 ```
 
 The installer detects the Debian architecture (`amd64` or `arm64`), resolves the
@@ -793,7 +853,7 @@ route or verification fails.
 To explicitly enable and start it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-rename/main/install.sh | bash -s -- --start
+curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-manager/main/install.sh | bash -s -- --start
 ```
 
 `--start` enables and restarts the service, including on upgrades, so the newly
@@ -804,7 +864,7 @@ alternative names.
 For reproducible installs, pin both the script and package to a release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-rename/v0.1.1/install.sh | bash -s -- --version v0.1.1
+curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-manager/v0.1.1/install.sh | bash -s -- --version v0.1.1
 ```
 
 These URLs require the source and a release to be published; the `v0.1.1` example
@@ -818,14 +878,108 @@ download and inspect it before running. Checksums detect corrupt or mismatched
 assets; because the package and checksums come from the same GitHub release,
 they do not protect against a compromised repository or publisher.
 
+### Migrating from veth-rename / veth-renamer
+
+The old repository was named `veth-rename`, but its released Debian package,
+binary and service were named **`veth-renamer`**. The new package is
+**`veth-manager`**. Do not run both daemons together. Schedule a maintenance
+window: stopping/restarting clears firewall connection state and starting in
+`primary-repair` mode can briefly interrupt managed interfaces.
+
+1. Back up the old configuration and unit overrides before removing anything:
+
+   ```bash
+   backup="$HOME/veth-renamer-backup-$(date +%Y%m%d-%H%M%S)"
+   mkdir -m 0700 "$backup"
+   for path in /etc/veth-renamer /etc/systemd/system/veth-renamer.service \
+       /etc/systemd/system/veth-renamer.service.d /etc/logrotate.d/veth-renamer; do
+       if sudo test -e "$path"; then
+           sudo cp -a -- "$path" "$backup/"
+       fi
+   done
+   dpkg-query -W -f='${Package} ${Status} ${Version}\n' veth-renamer
+   ```
+
+2. Stop the old service and remove the old package (not purge; keep configuration):
+
+   ```bash
+   sudo systemctl disable --now veth-renamer.service
+   sudo apt-get remove veth-renamer
+   ```
+
+   If your host actually has a package named `veth-rename`, remove that package
+   instead. For an unpackaged/manual installation, stop and disable its old unit
+   and remove the backed-up `/etc/systemd/system/veth-renamer.service` explicitly.
+   Old binaries in `/usr/local/sbin` are not removed by apt; remove them separately
+   after verifying they are no longer used. Existing interface names are not
+   restored when the old service stops.
+
+3. Install the new package **without `--start`** until configuration is migrated:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/mayberryjp/veth-manager/main/install.sh | bash
+   ```
+
+   This requires a published release in the new repository. The package conflicts
+   with both old package names to prevent simultaneous package installations.
+
+4. Copy your configuration and drop-ins to their new locations. The following
+   commands refuse to overwrite pre-existing new directories:
+
+   ```bash
+   if sudo test -d /etc/veth-renamer; then
+       sudo test ! -e /etc/veth-manager && sudo cp -a /etc/veth-renamer /etc/veth-manager
+   fi
+   if sudo test -d /etc/systemd/system/veth-renamer.service.d; then
+       sudo test ! -e /etc/systemd/system/veth-manager.service.d &&
+           sudo cp -a /etc/systemd/system/veth-renamer.service.d /etc/systemd/system/veth-manager.service.d
+   fi
+   ```
+
+   Edit the copied YAML and systemd `.conf` files, replacing old binary/service
+   and path references:
+
+   | Old | New |
+   | --- | --- |
+   | `/usr/sbin/veth-renamer` | `/usr/sbin/veth-manager` |
+   | `/etc/veth-renamer` | `/etc/veth-manager` |
+   | `/run/veth-renamer` | `/run/veth-manager` |
+   | `/var/log/veth-renamer` | `/var/log/veth-manager` |
+   | `veth-renamer.service` | `veth-manager.service` |
+   | `LogsDirectory=veth-renamer` | `LogsDirectory=veth-manager` |
+   | `RuntimeDirectory=veth-renamer` | `RuntimeDirectory=veth-manager` |
+
+   Relative `manual_rules: manual.yaml` and `sando_rules: sando.yaml` need no
+   changes. Preserve custom options, collectors and Sando endpoints. Update
+   `ReadWritePaths` in any Sando-write override to `/etc/veth-manager`.
+   Install the new supplied IPFIX/firewall drop-in if you did not have one before.
+   Custom drop-log paths also require updating `/etc/logrotate.d/veth-manager`.
+   Do not copy an old full unit over the new packaged unit; migrate its overrides.
+   Old logs remain in the old log directory. The new analyzer can read them with
+   `--firewall-log=/var/log/veth-renamer/firewall-drops.log`.
+
+5. Review the effective unit and start only the new service:
+
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl cat veth-manager.service
+   sudo systemctl enable --now veth-manager.service
+   sudo systemctl is-active veth-manager.service
+   sudo journalctl -u veth-manager.service --since "5 minutes ago" --no-pager -o cat
+   dpkg-query -W -f='${Version}\n' veth-manager
+   ```
+
+   Keep backups until the new service, monitoring and firewall are verified.
+   Update operational scripts, dashboards and journal filters to the new name.
+
 ### Upgrade and uninstall
 
 Rerun the installer to upgrade. Existing systemd overrides are preserved.
 Without `--start`, a running daemon keeps its old process until you explicitly
-run `sudo systemctl restart veth-renamer.service`.
+run `sudo systemctl restart veth-manager.service`.
 
 ```bash
-sudo apt-get remove veth-renamer
+sudo apt-get remove veth-manager
 ```
 
 Removal stops and disables the service. Administrator-created overrides are
@@ -834,11 +988,11 @@ deletes alternative names on existing interfaces.
 
 The package installs the binary in `/usr/sbin` and the unit in
 `/usr/lib/systemd/system`. If migrating from an older manual install in
-`/etc/systemd/system/veth-renamer.service`, first back up that local unit and
+`/etc/systemd/system/veth-manager.service`, first back up that local unit and
 migrate custom settings into a systemd drop-in. Stop the service and remove the
 old local unit after backing it up, then run `sudo systemctl daemon-reload` and
 retry the installer. It refuses to silently override a local unit. An old
-`/usr/local/sbin/veth-renamer` binary can be removed separately after migration.
+`/usr/local/sbin/veth-manager` binary can be removed separately after migration.
 
 ## Build and preview
 
@@ -853,16 +1007,16 @@ sudo apt-get install -y iproute2 util-linux
 go test ./...
 go vet ./...
 mkdir -p bin
-CGO_ENABLED=0 go build -trimpath -o bin/veth-renamer .
+CGO_ENABLED=0 go build -trimpath -o bin/veth-manager .
 
 # Read-only preview: no interface changes.
-sudo ./bin/veth-renamer --once --dry-run
+sudo ./bin/veth-manager --once --dry-run
 
 # Repair actual primary names, briefly interrupting the affected host veth.
-sudo ./bin/veth-renamer --once
+sudo ./bin/veth-manager --once
 
 # Non-disruptive alternative naming.
-sudo ./bin/veth-renamer --once --mode=alternative
+sudo ./bin/veth-manager --once --mode=alternative
 ```
 
 After changing the packet parser, regenerate the checked-in object on Linux
@@ -886,17 +1040,17 @@ commands inside the containers.
 ## Install as a host service
 
 ```bash
-sudo install -m 0755 bin/veth-renamer /usr/sbin/veth-renamer
-sudo install -m 0644 deploy/veth-renamer.service /etc/systemd/system/veth-renamer.service
+sudo install -m 0755 bin/veth-manager /usr/sbin/veth-manager
+sudo install -m 0644 deploy/veth-manager.service /etc/systemd/system/veth-manager.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now veth-renamer
-sudo journalctl -u veth-renamer -f
+sudo systemctl enable --now veth-manager
+sudo journalctl -u veth-manager -f
 ```
 
 The supplied unit uses **primary-repair mode**. To use alternative names:
 
 ```bash
-sudo systemctl edit veth-renamer
+sudo systemctl edit veth-manager
 ```
 
 Add this override:
@@ -904,10 +1058,10 @@ Add this override:
 ```ini
 [Service]
 ExecStart=
-ExecStart=/usr/sbin/veth-renamer --mode=alternative --mapping-file=/run/veth-renamer/mappings.json
+ExecStart=/usr/sbin/veth-manager --mode=alternative --mapping-file=/run/veth-manager/mappings.json
 ```
 
-Then run `sudo systemctl daemon-reload && sudo systemctl restart veth-renamer`.
+Then run `sudo systemctl daemon-reload && sudo systemctl restart veth-manager`.
 
 The unit deliberately runs on the host as root, with bounded capabilities for
 namespace entry and link management. It does not use a privileged container,
@@ -976,7 +1130,7 @@ if a primary rename succeeds.
 
 ### Mapping output
 
-The systemd unit writes `/run/veth-renamer/mappings.json`. Each snapshot has
+The systemd unit writes `/run/veth-manager/mappings.json`. Each snapshot has
 `updated_at`, `mode`, `dry_run`, and a `mappings` array containing:
 
 - Container ID/name, Docker network ID/name, bridge, IPv4, and IPv6.
@@ -1041,7 +1195,7 @@ without altering host interfaces.
 
 [.goreleaser.yaml](.goreleaser.yaml) builds Linux amd64/arm64 binaries, standalone
 archives, Debian packages, and SHA-256 checksums. The package declares
-`iproute2`, `util-linux`, and `systemd` dependencies; Docker must already be set
+`iproute2`, `util-linux`, `systemd`, and `logrotate` dependencies; Docker must already be set
 up separately. Package scripts reload systemd but never automatically start,
 enable, or restart the service, including during upgrades.
 
@@ -1055,13 +1209,13 @@ job regenerates the eBPF object before running Go and live-kernel tests.
 
 To publish:
 
-1. Commit and push this project to `mayberryjp/veth-rename`, with `main` as the
+1. Commit and push this project to `mayberryjp/veth-manager`, with `main` as the
    default branch. The source must be published for the raw installer URL to work.
 2. Push a semantic version tag, for example `v0.1.1`. The workflow creates the
    GitHub Release and uploads `.deb` packages, archives, `checksums.txt`, and
    `install.sh`. It uses the workflow's `GITHUB_TOKEN`; no personal token is needed.
 3. Confirm the workflow passed and the release contains
-   `veth-renamer_0.1.1_amd64.deb` and `veth-renamer_0.1.1_arm64.deb` before
+   `veth-manager_0.1.1_amd64.deb` and `veth-manager_0.1.1_arm64.deb` before
    sharing the install command.
 
 Locally, with GoReleaser v2.18.3, Bash, and Debian package tools available:

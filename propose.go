@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"veth-rename/internal/firewall"
+	"veth-manager/internal/firewall"
 )
 
 func proposeRules(out io.Writer, path, since, sortBy string, now time.Time) error {

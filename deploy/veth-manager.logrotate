@@ -1,0 +1,10 @@
+/var/log/veth-manager/firewall-drops.log {
+    daily
+    maxsize 10M
+    rotate 7
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}

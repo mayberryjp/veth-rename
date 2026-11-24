@@ -14,7 +14,7 @@ import (
 )
 
 // Legacy records have no year or timezone; new records carry an explicit TIME.
-var dropRecord = regexp.MustCompile(`^([A-Z][a-z]{2} [ 0-9][0-9] [0-9:]{8}) \S+ veth-renamer\[[0-9]+\]: (DROP|WOULD_DROP) IF=("(?:\\.|[^"\\])*") DIR=(ingress|egress) SRC=(\S+) DST=(\S+) PROTO=([0-9]+) SPT=([0-9]+) DPT=([0-9]+) LEN=([0-9]+) RULE=("(?:\\.|[^"\\])*") REASON=(\S+)(?: TIME=(\S+))?$`)
+var dropRecord = regexp.MustCompile(`^([A-Z][a-z]{2} [ 0-9][0-9] [0-9:]{8}) \S+ (?:veth-manager|veth-renamer)\[[0-9]+\]: (DROP|WOULD_DROP) IF=("(?:\\.|[^"\\])*") DIR=(ingress|egress) SRC=(\S+) DST=(\S+) PROTO=([0-9]+) SPT=([0-9]+) DPT=([0-9]+) LEN=([0-9]+) RULE=("(?:\\.|[^"\\])*") REASON=(\S+)(?: TIME=(\S+))?$`)
 
 type DropTuple struct {
 	Interface, Direction, Action string

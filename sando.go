@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"veth-rename/internal/firewall"
+	"veth-manager/internal/firewall"
 )
 
 type sandoResult struct {

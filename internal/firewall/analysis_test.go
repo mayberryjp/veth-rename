@@ -11,7 +11,7 @@ import (
 )
 
 func analysisRecord(when time.Time, sourcePort, length int) string {
-	return fmt.Sprintf("%s host veth-renamer[123]: DROP IF=\"veth app\" DIR=ingress SRC=10.0.0.1 DST=203.0.113.1 PROTO=6 SPT=%d DPT=443 LEN=%d RULE=\"deny\\nquoted\\\"\" REASON=rule-deny TIME=%s\n",
+	return fmt.Sprintf("%s host veth-manager[123]: DROP IF=\"veth app\" DIR=ingress SRC=10.0.0.1 DST=203.0.113.1 PROTO=6 SPT=%d DPT=443 LEN=%d RULE=\"deny\\nquoted\\\"\" REASON=rule-deny TIME=%s\n",
 		when.Format(time.Stamp), sourcePort, length, when.Format(time.RFC3339Nano))
 }
 
@@ -77,6 +77,16 @@ func TestAnalyzeDropsLastSeenOutOfOrder(t *testing.T) {
 	}
 }
 
+func TestAnalyzeDropsAcceptsPreMigrationLogs(t *testing.T) {
+	now := time.Now()
+	input := analysisRecord(now, 40000, 40) +
+		strings.Replace(analysisRecord(now, 50000, 60), "veth-manager[", "veth-renamer[", 1)
+	rows, err := AnalyzeDrops(strings.NewReader(input), now, time.Hour, "packets")
+	if err != nil || len(rows) != 1 || rows[0].Packets != 2 || rows[0].Bytes != 100 {
+		t.Fatalf("pre-migration records not aggregated: %+v %v", rows, err)
+	}
+}
+
 func TestWriteDropSummaryRelativeLastSeen(t *testing.T) {
 	now := time.Date(2026, 1, 2, 0, 5, 0, 0, time.UTC)
 	for _, tc := range []struct {
@@ -115,7 +125,7 @@ func TestAnalyzeDropsNormalizesReturnTraffic(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			record := func(source, destination, direction string, sourcePort, destinationPort, length int) string {
-				return fmt.Sprintf("%s host veth-renamer[123]: WOULD_DROP IF=\"app\" DIR=%s SRC=%s DST=%s PROTO=%d SPT=%d DPT=%d LEN=%d RULE=\"default\" REASON=default-deny TIME=%s\n",
+				return fmt.Sprintf("%s host veth-manager[123]: WOULD_DROP IF=\"app\" DIR=%s SRC=%s DST=%s PROTO=%d SPT=%d DPT=%d LEN=%d RULE=\"default\" REASON=default-deny TIME=%s\n",
 					now.Format(time.Stamp), direction, source, destination, tc.protocol, sourcePort, destinationPort, length, now.Format(time.RFC3339Nano))
 			}
 			input := record(tc.source, tc.destination, tc.direction, 40000, 443, 40) +
@@ -154,7 +164,7 @@ func TestAnalyzeDropsPreservesEqualPortsAndNonTransportRecords(t *testing.T) {
 		{"icmpv6-type-code", 58, 0, 32768},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			input := fmt.Sprintf("%s host veth-renamer[123]: DROP IF=\"app\" DIR=egress SRC=2001:db8::1 DST=2001:db8::2 PROTO=%d SPT=%d DPT=%d LEN=40 RULE=\"default\" REASON=default-deny TIME=%s\n",
+			input := fmt.Sprintf("%s host veth-manager[123]: DROP IF=\"app\" DIR=egress SRC=2001:db8::1 DST=2001:db8::2 PROTO=%d SPT=%d DPT=%d LEN=40 RULE=\"default\" REASON=default-deny TIME=%s\n",
 				now.Format(time.Stamp), tc.protocol, tc.sport, tc.dport, now.Format(time.RFC3339Nano))
 			rows, err := AnalyzeDrops(strings.NewReader(input), now, time.Hour, "packets")
 			if err != nil || len(rows) != 1 || rows[0].Source != "2001:db8::1" ||
@@ -167,7 +177,7 @@ func TestAnalyzeDropsPreservesEqualPortsAndNonTransportRecords(t *testing.T) {
 
 func TestAnalyzeDropsLegacyIPv6AndSeparateVerdicts(t *testing.T) {
 	now := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
-	legacy := `Dec 31 23:00:00 host veth-renamer[1]: DROP IF="veth" DIR=egress SRC=2001:db8::1 DST=2001:db8::2 PROTO=17 SPT=123 DPT=53 LEN=48 RULE="default" REASON=default-deny` + "\n"
+	legacy := `Dec 31 23:00:00 host veth-manager[1]: DROP IF="veth" DIR=egress SRC=2001:db8::1 DST=2001:db8::2 PROTO=17 SPT=123 DPT=53 LEN=48 RULE="default" REASON=default-deny` + "\n"
 	audit := strings.Replace(legacy, ": DROP ", ": WOULD_DROP ", 1)
 	current := strings.Replace(legacy, "Dec 31 23:00:00", "Jan  1 00:00:00", 1)
 	future := strings.Replace(current, "00:00:00", "02:00:00", 1)

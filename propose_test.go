@@ -15,7 +15,7 @@ func TestProposeRulesCLI(t *testing.T) {
 	config := filepath.Join(dir, "firewall.yaml")
 	now := time.Now()
 	record := func(when time.Time) string {
-		return when.Format(time.Stamp) + ` host veth-renamer[1]: DROP IF="app" DIR=ingress SRC=10.0.0.1 DST=203.0.113.1 PROTO=6 SPT=123 DPT=443 LEN=40 RULE="default" REASON=default-deny TIME=` + when.Format(time.RFC3339Nano) + "\n"
+		return when.Format(time.Stamp) + ` host veth-manager[1]: DROP IF="app" DIR=ingress SRC=10.0.0.1 DST=203.0.113.1 PROTO=6 SPT=123 DPT=443 LEN=40 RULE="default" REASON=default-deny TIME=` + when.Format(time.RFC3339Nano) + "\n"
 	}
 	if err := os.WriteFile(path, []byte(record(now.Add(-time.Hour))+record(now.Add(-48*time.Hour))), 0600); err != nil {
 		t.Fatal(err)

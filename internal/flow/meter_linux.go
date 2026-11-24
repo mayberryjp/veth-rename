@@ -12,7 +12,7 @@ import (
 	"os"
 	"time"
 
-	"veth-rename/internal/firewall"
+	"veth-manager/internal/firewall"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -41,6 +41,7 @@ type meterOptions struct {
 	collector            Key
 	ringBytes            uint32
 	stateEntries         uint32
+	fragmentEntries      uint32
 	firewall             *firewall.Policy
 }
 
@@ -103,11 +104,15 @@ func loadConfiguredMeter(options meterOptions) (*kernelMeter, error) {
 	}
 	if enabled == 0 {
 		spec.Maps["connections"].MaxEntries = 1
+		spec.Maps["fragments"].MaxEntries = 1
 		spec.Maps["rules"].InnerMap.MaxEntries = 1
 		spec.Maps["rule_template"].MaxEntries = 1
 		spec.Maps["drops"].MaxEntries = 4096
 	} else if options.stateEntries != 0 {
 		spec.Maps["connections"].MaxEntries = options.stateEntries
+	}
+	if enabled != 0 && options.fragmentEntries != 0 {
+		spec.Maps["fragments"].MaxEntries = options.fragmentEntries
 	}
 	if err := spec.RewriteConstants(map[string]interface{}{
 		"sampling_rate": samplingRate, "capture_filter": options.filter, "collector": options.collector,

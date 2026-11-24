@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo=mayberryjp/veth-rename
+repo=mayberryjp/veth-manager
 version=latest
 start=false
 
@@ -13,7 +13,7 @@ Downloads a Debian package from GitHub Releases, verifies its SHA-256 checksum,
 and installs it with apt-get. Supports Linux amd64 and arm64.
 
   --version TAG  Install a specific release (default: latest stable release).
-  --repo REPO    GitHub repository (default: mayberryjp/veth-rename).
+  --repo REPO    GitHub repository (default: mayberryjp/veth-manager).
   --start        Enable and restart the service after installation.
   --help         Show this help.
 
@@ -63,8 +63,8 @@ if [[ "$(id -u)" != 0 ]]; then
     command -v sudo >/dev/null || die "Run as root or install sudo"
     privilege=(sudo)
 fi
-if [[ -e /etc/systemd/system/veth-renamer.service || -L /etc/systemd/system/veth-renamer.service ]]; then
-    die "A local unit exists at /etc/systemd/system/veth-renamer.service and would shadow the packaged unit. Back it up and migrate customizations to veth-renamer.service.d before retrying."
+if [[ -e /etc/systemd/system/veth-manager.service || -L /etc/systemd/system/veth-manager.service ]]; then
+    die "A local unit exists at /etc/systemd/system/veth-manager.service and would shadow the packaged unit. Back it up and migrate customizations to veth-manager.service.d before retrying."
 fi
 
 download() {
@@ -84,7 +84,7 @@ if [[ "$version" == latest ]]; then
         die "Latest release is not a stable vX.Y.Z tag: $version"
 fi
 
-asset="veth-renamer_${version#v}_${arch}.deb"
+asset="veth-manager_${version#v}_${arch}.deb"
 base="https://github.com/$repo/releases/download/$version"
 tmp=$(mktemp -d)
 cleanup() { rm -f -- "$tmp/$asset" "$tmp/checksums.txt" "$tmp/release.json"; rmdir -- "$tmp"; }
@@ -149,8 +149,8 @@ done < "$tmp/checksums.txt"
     printf '%s  %s\n' "$digest" "$asset" | sha256sum --check --status
 ) || die "Checksum verification failed; nothing was installed"
 
-[[ "$(dpkg-deb --field "$tmp/$asset" Package)" == veth-renamer ]] ||
-    die "Downloaded file is not a veth-renamer package"
+[[ "$(dpkg-deb --field "$tmp/$asset" Package)" == veth-manager ]] ||
+    die "Downloaded file is not a veth-manager package"
 [[ "$(dpkg-deb --field "$tmp/$asset" Architecture)" == "$arch" ]] ||
     die "Downloaded package architecture does not match $arch"
 
@@ -160,12 +160,12 @@ chmod 0644 "$tmp/$asset"
 "${privilege[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install --yes "$tmp/$asset"
 
 if "$start"; then
-    "${privilege[@]}" systemctl enable veth-renamer.service
-    "${privilege[@]}" systemctl restart veth-renamer.service
-    "${privilege[@]}" systemctl is-active --quiet veth-renamer.service
-    printf 'Installed %s and enabled/restarted veth-renamer.service.\n' "$version"
+    "${privilege[@]}" systemctl enable veth-manager.service
+    "${privilege[@]}" systemctl restart veth-manager.service
+    "${privilege[@]}" systemctl is-active --quiet veth-manager.service
+    printf 'Installed %s and enabled/restarted veth-manager.service.\n' "$version"
 else
     printf 'Installed %s. The service was not started or restarted.\n' "$version"
-    printf 'To enable/start: sudo systemctl enable --now veth-renamer.service\n'
-    printf 'If already running, load the new binary: sudo systemctl restart veth-renamer.service\n'
+    printf 'To enable/start: sudo systemctl enable --now veth-manager.service\n'
+    printf 'If already running, load the new binary: sudo systemctl restart veth-manager.service\n'
 fi

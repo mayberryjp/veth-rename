@@ -9,7 +9,7 @@ import (
 	"sort"
 	"time"
 
-	"veth-rename/internal/firewall"
+	"veth-manager/internal/firewall"
 )
 
 const shutdownBudget = 2 * time.Second

@@ -4,7 +4,7 @@ package flow
 
 import (
 	"fmt"
-	"veth-rename/internal/firewall"
+	"veth-manager/internal/firewall"
 )
 
 func platformReady() error {

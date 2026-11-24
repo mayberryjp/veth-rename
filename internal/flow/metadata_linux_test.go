@@ -193,7 +193,7 @@ func TestKernelICMPTOSFlagsAndFragments(t *testing.T) {
 	other := ipv4Packet(false, 1234)
 	other[23] = 47
 	testPacket(t, m, other)
-	// Both initial and later IPv4 fragments, and IPv6 atomic/real fragments.
+	// Real fragments remain excluded; IPv6 atomic fragments are complete packets.
 	for _, bits := range []uint16{0x2000, 1} {
 		b := ipv4Packet(false, 1234)
 		binary.BigEndian.PutUint16(b[20:22], bits)
@@ -226,7 +226,11 @@ func TestKernelICMPTOSFlagsAndFragments(t *testing.T) {
 			}
 		case 17:
 			tosFlows++
-			if (k.TOS != 0 && k.TOS != 0xb8) || v.Packets != 1 {
+			want := uint64(1)
+			if k.Family == 6 && k.TOS == 0 {
+				want = 2
+			}
+			if (k.TOS != 0 && k.TOS != 0xb8) || v.Packets != want {
 				t.Fatalf("TOS key %+v %+v", k, v)
 			}
 		case 6:
@@ -252,7 +256,7 @@ func TestKernelICMPTOSFlagsAndFragments(t *testing.T) {
 	for _, v := range excluded {
 		total += v
 	}
-	if total != 5 {
+	if total != 4 {
 		t.Fatalf("excluded fragment packets=%d", total)
 	}
 	losses, err := m.Losses()

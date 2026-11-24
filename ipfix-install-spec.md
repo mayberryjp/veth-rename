@@ -1,6 +1,6 @@
 # IPFIX installation specification
 
-This guide installs the GitHub release of veth-renamer and enables its optional
+This guide installs the GitHub release of veth-manager and enables its optional
 eBPF-to-IPFIX exporter on an Ubuntu Docker host. Commands are for the exporter
 server unless explicitly marked **collector**.
 
@@ -32,7 +32,7 @@ Use a trusted network. UDP IPFIX is neither encrypted nor delivery-guaranteed.
 
 Version `v0.1.9` includes this feature and is published at:
 
-[v0.1.9 release](https://github.com/mayberryjp/veth-rename/releases/tag/v0.1.9)
+[v0.1.9 release](https://github.com/mayberryjp/veth-manager/releases/tag/v0.1.9)
 
 For any newer version, wait until its release workflow has passed and the release
 page contains the appropriate `.deb` package and `checksums.txt`. A Git tag or a
@@ -42,9 +42,9 @@ Download the pinned installer, then run it only if the download succeeds:
 
 ```bash
 curl -fsSL \
-  https://raw.githubusercontent.com/mayberryjp/veth-rename/v0.1.9/install.sh \
-  -o /root/veth-renamer-install-v0.1.9.sh \
-  && bash /root/veth-renamer-install-v0.1.9.sh --version v0.1.9
+  https://raw.githubusercontent.com/mayberryjp/veth-manager/v0.1.9/install.sh \
+  -o /root/veth-manager-install-v0.1.9.sh \
+  && bash /root/veth-manager-install-v0.1.9.sh --version v0.1.9
 ```
 
 The downloaded script can be reviewed before execution by running the download
@@ -57,10 +57,10 @@ previous executable until explicitly restarted.
 Verify installation:
 
 ```bash
-dpkg-query -W -f='${Package} ${Version}\n' veth-renamer
-ls -l /usr/sbin/veth-renamer
-ls -l /usr/share/doc/veth-renamer/ipfix.example.yaml \
-      /usr/share/doc/veth-renamer/ipfix.conf
+dpkg-query -W -f='${Package} ${Version}\n' veth-manager
+ls -l /usr/sbin/veth-manager
+ls -l /usr/share/doc/veth-manager/ipfix.example.yaml \
+      /usr/share/doc/veth-manager/ipfix.conf
 ```
 
 If the installer reports a failure, do not proceed to restart the service.
@@ -74,12 +74,12 @@ Create the configuration directory and copy the example only when no
 configuration already exists:
 
 ```bash
-install -d -m 0755 /etc/veth-renamer
-if [ ! -e /etc/veth-renamer/ipfix.yaml ]; then
-  install -m 0644 /usr/share/doc/veth-renamer/ipfix.example.yaml \
-    /etc/veth-renamer/ipfix.yaml
+install -d -m 0755 /etc/veth-manager
+if [ ! -e /etc/veth-manager/ipfix.yaml ]; then
+  install -m 0644 /usr/share/doc/veth-manager/ipfix.example.yaml \
+    /etc/veth-manager/ipfix.yaml
 fi
-nano /etc/veth-renamer/ipfix.yaml
+nano /etc/veth-manager/ipfix.yaml
 ```
 
 Back up an existing configuration before editing it. Use YAML, not JSON.
@@ -130,16 +130,16 @@ to the socket's path estimate, allowing for IPv4/UDP or IPv6/UDP headers.
 ## 4. Enable IPFIX in systemd
 
 Installing the package alone does not enable monitoring. The service needs
-`--ipfix-config=/etc/veth-renamer/ipfix.yaml` and the additional capabilities and
+`--ipfix-config=/etc/veth-manager/ipfix.yaml` and the additional capabilities and
 address families supplied by this drop-in:
 
 ```bash
-install -d -m 0755 /etc/systemd/system/veth-renamer.service.d
-if [ ! -e /etc/systemd/system/veth-renamer.service.d/ipfix.conf ]; then
-  install -m 0644 /usr/share/doc/veth-renamer/ipfix.conf \
-    /etc/systemd/system/veth-renamer.service.d/ipfix.conf
+install -d -m 0755 /etc/systemd/system/veth-manager.service.d
+if [ ! -e /etc/systemd/system/veth-manager.service.d/ipfix.conf ]; then
+  install -m 0644 /usr/share/doc/veth-manager/ipfix.conf \
+    /etc/systemd/system/veth-manager.service.d/ipfix.conf
 fi
-nano /etc/systemd/system/veth-renamer.service.d/ipfix.conf
+nano /etc/systemd/system/veth-manager.service.d/ipfix.conf
 ```
 
 The supplied contents are:
@@ -147,7 +147,7 @@ The supplied contents are:
 ```ini
 [Service]
 ExecStart=
-ExecStart=/usr/sbin/veth-renamer --mode=primary-repair --mapping-file=/run/veth-renamer/mappings.json --ipfix-config=/etc/veth-renamer/ipfix.yaml
+ExecStart=/usr/sbin/veth-manager --mode=primary-repair --mapping-file=/run/veth-manager/mappings.json --ipfix-config=/etc/veth-manager/ipfix.yaml
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_BPF CAP_PERFMON
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 ```
@@ -167,8 +167,8 @@ Reload the unit and inspect the effective settings:
 
 ```bash
 systemctl daemon-reload
-systemctl cat veth-renamer.service
-systemctl show veth-renamer.service \
+systemctl cat veth-manager.service
+systemctl show veth-manager.service \
   -p ExecStart -p CapabilityBoundingSet -p RestrictAddressFamilies
 ```
 
@@ -179,8 +179,8 @@ are allowed. Resolve conflicting overrides before starting.
 Enable startup at boot and start/restart the daemon:
 
 ```bash
-systemctl enable veth-renamer.service \
-  && systemctl restart veth-renamer.service
+systemctl enable veth-manager.service \
+  && systemctl restart veth-manager.service
 ```
 
 Changing YAML requires another restart. Editing a systemd drop-in requires
@@ -191,10 +191,10 @@ Changing YAML requires another restart. Editing a systemd drop-in requires
 ### Service and startup logs
 
 ```bash
-systemctl is-enabled veth-renamer.service
-systemctl is-active veth-renamer.service
-systemctl status veth-renamer.service --no-pager
-journalctl -u veth-renamer.service --since '5 minutes ago' --no-pager
+systemctl is-enabled veth-manager.service
+systemctl is-active veth-manager.service
+systemctl status veth-manager.service --no-pager
+journalctl -u veth-manager.service --since '5 minutes ago' --no-pager
 ```
 
 Look for **`eBPF IPFIX monitoring enabled`** and inspect subsequent errors.

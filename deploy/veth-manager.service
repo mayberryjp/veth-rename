@@ -9,10 +9,10 @@ StartLimitBurst=5
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/sbin/veth-renamer --mode=primary-repair --mapping-file=/run/veth-renamer/mappings.json
+ExecStart=/usr/sbin/veth-manager --mode=primary-repair --mapping-file=/run/veth-manager/mappings.json
 Restart=on-failure
 RestartSec=5
-RuntimeDirectory=veth-renamer
+RuntimeDirectory=veth-manager
 RuntimeDirectoryMode=0755
 UMask=0022
 NoNewPrivileges=true

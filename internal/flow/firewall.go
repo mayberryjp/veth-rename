@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	"veth-rename/internal/firewall"
+	"veth-manager/internal/firewall"
 )
 
 type Drop struct {
@@ -180,7 +180,8 @@ func writeDrop(out io.Writer, host string, iface Interface, policy *firewall.Pol
 	if drop.Direction == 2 {
 		direction = "egress"
 	}
-	reasons := [...]string{"default-deny", "rule-deny", "malformed", "unsupported-or-fragment", "state-table-full", "policy-unavailable"}
+	reasons := [...]string{"default-deny", "rule-deny", "malformed", "unsupported-or-fragment", "state-table-full", "policy-unavailable",
+		"fragment-unauthorized", "fragment-invalid", "fragment-table-full"}
 	if drop.Reason >= uint8(len(reasons)) || (drop.Direction != 1 && drop.Direction != 2) {
 		return fmt.Errorf("invalid firewall drop direction or reason")
 	}
@@ -188,7 +189,7 @@ func writeDrop(out io.Writer, host string, iface Interface, policy *firewall.Pol
 	if !policy.Config.Enforces(drop.Direction) {
 		action = "WOULD_DROP"
 	}
-	_, err := fmt.Fprintf(out, "%s %s veth-renamer[%d]: %s IF=%q DIR=%s SRC=%s DST=%s PROTO=%d SPT=%d DPT=%d LEN=%d RULE=%q REASON=%s TIME=%s\n",
+	_, err := fmt.Fprintf(out, "%s %s veth-manager[%d]: %s IF=%q DIR=%s SRC=%s DST=%s PROTO=%d SPT=%d DPT=%d LEN=%d RULE=%q REASON=%s TIME=%s\n",
 		timestamp.Local().Format(time.Stamp), host, os.Getpid(), action, iface.Name, direction,
 		address(drop.Source, drop.Family), address(drop.Destination, drop.Family), drop.Protocol,
 		drop.SourcePort, drop.DestinationPort, drop.Octets, rule, reasons[drop.Reason], timestamp.Format(time.RFC3339Nano))

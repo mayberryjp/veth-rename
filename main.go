@@ -17,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"veth-rename/internal/firewall"
-	"veth-rename/internal/flow"
+	"veth-manager/internal/firewall"
+	"veth-manager/internal/flow"
 )
 
 func writeSnapshot(path string, result snapshot) error {
@@ -27,7 +27,7 @@ func writeSnapshot(path string, result snapshot) error {
 		return err
 	}
 	data = append(data, '\n')
-	f, err := os.CreateTemp(filepath.Dir(path), ".veth-renamer-*")
+	f, err := os.CreateTemp(filepath.Dir(path), ".veth-manager-*")
 	if err != nil {
 		return err
 	}
@@ -50,7 +50,7 @@ func writeSnapshot(path string, result snapshot) error {
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	if err := run(log); err != nil {
-		log.Error("veth-renamer stopped", "error", err)
+		log.Error("veth-manager stopped", "error", err)
 		os.Exit(1)
 	}
 }
@@ -209,7 +209,7 @@ func run(log *slog.Logger) (runErr error) {
 		return fmt.Errorf("this daemon must run directly on a Linux Docker host")
 	}
 	if !*dryRun {
-		lock, err := net.Listen("unix", "@veth-renamer-interface-owner")
+		lock, err := net.Listen("unix", "@veth-manager-interface-owner")
 		if err != nil {
 			return fmt.Errorf("another interface renamer instance may be running: %w", err)
 		}

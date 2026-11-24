@@ -10,8 +10,8 @@ cleanup() {
     rm -f -- "$tmp/stub" "$tmp/package" "$tmp/log" "$tmp/output"
     # Failed installers must clean their downloads too.
     if [[ -d "$tmp/download" ]]; then
-        rm -f -- "$tmp/download/veth-renamer_1.2.3_amd64.deb" \
-            "$tmp/download/veth-renamer_1.2.3_arm64.deb" "$tmp/download/checksums.txt" \
+        rm -f -- "$tmp/download/veth-manager_1.2.3_amd64.deb" \
+            "$tmp/download/veth-manager_1.2.3_arm64.deb" "$tmp/download/checksums.txt" \
             "$tmp/download/release.json"
         rmdir -- "$tmp/download"
     fi
@@ -38,7 +38,7 @@ case "$tool" in
                 if [[ "$TEST_SCENARIO" == wrong-package ]]; then
                     echo unrelated-package
                 else
-                    echo veth-renamer
+                    echo veth-manager
                 fi
                 ;;
             Architecture)
@@ -75,7 +75,7 @@ case "$tool" in
                 api=${url%/tags/*}
                 tag=v1.2.3
                 [[ "$TEST_SCENARIO" != wrong-tag ]] || tag=v9.9.9
-                package="veth-renamer_1.2.3_${TEST_ARCH}.deb"
+                package="veth-manager_1.2.3_${TEST_ARCH}.deb"
                 [[ "$TEST_SCENARIO" != missing-asset ]] || package=another.deb
                 asset_url="$api/assets/1"
                 [[ "$TEST_SCENARIO" != unsafe-api-url ]] || asset_url=https://example.invalid/package
@@ -94,7 +94,7 @@ case "$tool" in
                 [[ "$TEST_SCENARIO" != no-checksums ]] || exit 22
                 digest=$TEST_SUM
                 [[ "$TEST_SCENARIO" != fallback-bad-checksum ]] || digest=$(printf '%064d' 0)
-                printf '%s  veth-renamer_1.2.3_%s.deb\n' "$digest" "$TEST_ARCH" > "$out"
+                printf '%s  veth-manager_1.2.3_%s.deb\n' "$digest" "$TEST_ARCH" > "$out"
                 exit 0
                 ;;
         esac
@@ -112,7 +112,7 @@ case "$tool" in
                 case "$TEST_SCENARIO" in
                     no-checksums|checksum-fallback|both-fallback|fallback-bad-checksum) exit 22 ;;
                 esac
-                asset="veth-renamer_1.2.3_${TEST_ARCH}.deb"
+                asset="veth-manager_1.2.3_${TEST_ARCH}.deb"
                 digest=$TEST_SUM
                 case "$TEST_SCENARIO" in
                     missing-checksum) asset=another.deb ;;
@@ -170,7 +170,7 @@ run_bad() {
 run_ok --help
 assert_no_log curl
 run_ok --version v1.2.3
-assert_log '/releases/download/v1.2.3/veth-renamer_1.2.3_amd64.deb'
+assert_log '/releases/download/v1.2.3/veth-manager_1.2.3_amd64.deb'
 assert_log 'apt-get install --yes'
 assert_no_log systemctl
 assert_no_log '/releases/latest'
@@ -178,13 +178,13 @@ run_ok
 assert_log '/releases/latest'
 assert_log '/releases/download/v1.2.3/'
 run_ok --version v1.2.3 --start
-assert_log 'systemctl enable veth-renamer.service'
-assert_log 'systemctl restart veth-renamer.service'
-assert_log 'systemctl is-active --quiet veth-renamer.service'
+assert_log 'systemctl enable veth-manager.service'
+assert_log 'systemctl restart veth-manager.service'
+assert_log 'systemctl is-active --quiet veth-manager.service'
 run_ok --version v1.2.3 --repo another/project
 assert_log 'https://github.com/another/project/releases/download/'
 TEST_ARCH=arm64 run_ok --version v1.2.3
-assert_log 'veth-renamer_1.2.3_arm64.deb'
+assert_log 'veth-manager_1.2.3_arm64.deb'
 TEST_UID=1000 run_ok --version v1.2.3 --start
 assert_log 'sudo env DEBIAN_FRONTEND=noninteractive apt-get'
 assert_log 'sudo systemctl restart'

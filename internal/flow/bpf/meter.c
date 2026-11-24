@@ -58,9 +58,76 @@ static __always_inline __u16 be16(const __u8 *p) {
     return ((__u16)p[0] << 8) | p[1];
 }
 
+struct ipv6_context {
+    __u32 offset, octets, transport;
+};
+
+static __noinline int parse_ipv6(struct __sk_buff *skb, struct flow_key *key,
+                                 struct fragment_key *fragment,
+                                 struct fragment_packet *piece,
+                                 struct ipv6_context *context) {
+    __u8 ip[40];
+    __u32 offset = context->offset;
+    if (bpf_skb_load_bytes(skb, offset, ip, 40) || (ip[0] >> 4) != 6)
+        return -1;
+    __u32 octets = 40 + be16(ip + 4);
+    // IPv6 jumbograms need the Hop-by-Hop Jumbo Payload option.
+    if ((octets == 40 && skb->len > offset + 40) || offset + octets > skb->len)
+        return -1;
+    key->family = 6;
+    key->protocol = ip[6];
+    key->tos = ((ip[0] & 15) << 4) | (ip[1] >> 4);
+    __builtin_memcpy(key->source, ip + 8, 16);
+    __builtin_memcpy(key->destination, ip + 24, 16);
+    __u32 transport = offset + 40;
+    int fragmented = 0, fragment_header = 0;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (key->protocol == 0 || key->protocol == 43 ||
+            key->protocol == 60 || key->protocol == 51 || key->protocol == 44) {
+            __u8 extension[8];
+            if (transport + 8 > offset + octets ||
+                bpf_skb_load_bytes(skb, transport, extension, 8))
+                return -1;
+            __u32 length = (extension[1] + 1) * 8;
+            if (key->protocol == 51)
+                length = (extension[1] + 2) * 4;
+            if (key->protocol == 44) {
+                if (fragment_header || extension[1] || (be16(extension + 2) & 6))
+                    return -1;
+                fragment_header = 1;
+                __u16 bits = be16(extension + 2);
+                if (bits) {
+                    fragmented = 1;
+                    fragment->id = ((__u32)be16(extension + 4) << 16) | be16(extension + 6);
+                    fragment->protocol = extension[0];
+                    piece->start = bits & 0xfff8;
+                    piece->more = bits & 1;
+                    piece->limit = 65535 - (transport - offset - 40);
+                    piece->length = offset + octets - transport - 8;
+                }
+                length = 8;
+            }
+            key->protocol = extension[0];
+            transport += length;
+            if (fragmented && piece->start)
+                break;
+        }
+    }
+    if (transport > offset + octets ||
+        (!(fragmented && piece->start) &&
+         (key->protocol == 0 || key->protocol == 43 || key->protocol == 60 ||
+          key->protocol == 51 || key->protocol == 44)))
+        return -1;
+    context->octets = octets;
+    context->transport = transport;
+    return fragmented;
+}
+
 static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
     int sampled = 1;
     struct flow_key key = {};
+    int fragmented = 0;
     __u64 octets = 0;
     if (sampling_rate > 1) {
         __u32 index = 0;
@@ -77,6 +144,16 @@ static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
                 return -1;
         }
     }
+    __u32 scratch_index = 0;
+    struct fragment_seed *scratch = bpf_map_lookup_elem(&fragment_seeds, &scratch_index);
+    if (!scratch)
+        goto malformed;
+    struct fragment_key *fragment = &scratch->key;
+    struct fragment_packet *piece = &scratch->packet;
+    __builtin_memset(fragment, 0, sizeof(*fragment));
+    __builtin_memset(piece, 0, sizeof(*piece));
+    fragment->ifindex = skb->ifindex;
+    fragment->direction = direction;
     __u8 eth[14];
     if (bpf_skb_load_bytes(skb, 0, eth, sizeof(eth)))
         goto malformed;
@@ -88,6 +165,7 @@ static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
             __u8 vlan[4];
             if (bpf_skb_load_bytes(skb, offset, vlan, 4))
                 goto malformed;
+            fragment->vlan[i] = ((__u32)type << 16) | be16(vlan);
             type = be16(vlan + 2);
             offset += 4;
         }
@@ -115,46 +193,41 @@ static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
         key.tos = ip[1];
         __builtin_memcpy(key.source, ip + 12, 4);
         __builtin_memcpy(key.destination, ip + 16, 4);
-        if (be16(ip + 6) & 0x3fff)
-            goto excluded;
         transport = offset + ihl;
-    } else {
-        __u8 ip[40];
-        if (bpf_skb_load_bytes(skb, offset, ip, 40))
-            goto malformed;
-        if ((ip[0] >> 4) != 6)
-            goto malformed;
-        octets = 40 + be16(ip + 4);
-        // IPv6 jumbograms need the Hop-by-Hop Jumbo Payload option.
-        if ((octets == 40 && skb->len > offset + 40) || offset + octets > skb->len)
-            goto malformed;
-        key.family = 6;
-        key.protocol = ip[6];
-        key.tos = ((ip[0] & 15) << 4) | (ip[1] >> 4);
-        __builtin_memcpy(key.source, ip + 8, 16);
-        __builtin_memcpy(key.destination, ip + 24, 16);
-        transport = offset + 40;
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            if (key.protocol == 0 || key.protocol == 43 ||
-                key.protocol == 60 || key.protocol == 51 || key.protocol == 44) {
-                __u8 extension[8];
-                if (transport + 8 > offset + octets ||
-                    bpf_skb_load_bytes(skb, transport, extension, 8))
-                    goto malformed;
-                __u32 length = (extension[1] + 1) * 8;
-                if (key.protocol == 51)
-                    length = (extension[1] + 2) * 4;
-                if (key.protocol == 44) {
-                    goto excluded;
-                }
-                key.protocol = extension[0];
-                transport += length;
-            }
+        __u16 bits = be16(ip + 6);
+        if (bits & 0x3fff) {
+            if (bits & 0xc000)
+                goto malformed;
+            fragmented = 1;
+            fragment->id = be16(ip + 4);
+            fragment->protocol = key.protocol;
+            piece->start = (bits & 0x1fff) * 8;
+            piece->more = !!(bits & 0x2000);
+            piece->length = octets - ihl;
+            piece->limit = 65535 - ihl;
         }
-        if (key.protocol == 0 || key.protocol == 43 || key.protocol == 60 ||
-            key.protocol == 51 || key.protocol == 44 || transport > offset + octets)
+    } else {
+        struct ipv6_context context = {.offset = offset};
+        fragmented = parse_ipv6(skb, &key, fragment, piece, &context);
+        if (fragmented < 0)
             goto malformed;
+        octets = context.octets;
+        transport = context.transport;
+    }
+    if (fragmented) {
+        if (!piece->length || piece->start + piece->length > piece->limit ||
+            (piece->more && piece->length % 8))
+            goto malformed;
+        if (!firewall_enabled)
+            goto excluded;
+        fragment->family = key.family;
+        __builtin_memcpy(fragment->source, key.source, 16);
+        __builtin_memcpy(fragment->destination, key.destination, 16);
+        if (piece->start) {
+            if (sampled)
+                loss(2);
+            return follow_fragment(fragment, piece, &key, octets);
+        }
     }
     __u8 tcp_flags = 0;
     if (key.protocol == 6 || key.protocol == 17 || key.protocol == 132) {
@@ -175,6 +248,15 @@ static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
             if (bpf_skb_load_bytes(skb, transport + 13, &tcp_flags, 1))
                 goto malformed;
         }
+        if (fragmented && key.protocol == 17) {
+            __u8 udp[8];
+            if (bpf_skb_load_bytes(skb, transport, udp, 8))
+                goto malformed;
+            piece->expected = piece->length - (offset + octets - transport) + be16(udp + 4);
+            if (be16(udp + 4) < 8 || piece->expected <= piece->length ||
+                piece->expected > piece->limit)
+                goto malformed;
+        }
     } else if ((key.family == 4 && key.protocol == 1) ||
                (key.family == 6 && key.protocol == 58)) {
         __u8 icmp[2];
@@ -182,6 +264,14 @@ static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
             bpf_skb_load_bytes(skb, transport, icmp, 2))
             goto malformed;
         key.destination_port = be16(icmp);
+    }
+    if (fragmented) {
+        if (sampled)
+            loss(2);
+        int reason = reserve_fragment(fragment, piece);
+        if (reason)
+            return deny(&key, direction, 0, reason, octets, 0);
+        goto enforce;
     }
     if (!sampled)
         goto enforce;
@@ -219,7 +309,13 @@ static __always_inline int process(struct __sk_buff *skb, __u8 direction) {
     event->time = bpf_ktime_get_ns();
     bpf_ringbuf_submit(event, 0);
 enforce:
-    return firewall(&key, direction, tcp_flags, octets);
+    {
+        struct firewall_decision decision = {};
+        int result = firewall(&key, direction, tcp_flags, octets, &decision);
+        if (fragmented)
+            return authorize_fragment(fragment, &key, &decision, octets, result);
+        return result;
+    }
 malformed:
     if (sampled)
         loss(1);

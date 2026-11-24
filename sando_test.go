@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"veth-rename/internal/firewall"
+	"veth-manager/internal/firewall"
 )
 
 func TestSandoPollingRepeatsAndCancelsInFlightRequest(t *testing.T) {
